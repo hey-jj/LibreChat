@@ -27,7 +27,7 @@ COPY . .
 # The real MONGO_URI is injected by Cloud Run from Secret Manager at runtime.
 ENV MONGO_URI="mongodb://temp"
 # Run the build script, allocating more memory to Node.js
-RUN NODE_OPTIONS="--max-old-space-size=4096" npm run build
+RUN NODE_OPTIONS="--max-old-space-size=4096" npm run frontend
 
 # Stage 4: Final production image
 FROM base AS production
