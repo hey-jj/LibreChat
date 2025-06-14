@@ -1,0 +1,59 @@
+#==================================================#
+#               Server Configuration               #
+#==================================================#
+NODE_ENV: "production"
+RAG_API_URL: "https://librechat-rag-api-w7rnxnpzqq-wm.a.run.app"
+MEILI_HOST: "http://10.180.0.2:7700"
+DOMAIN_CLIENT: "https://chat.heysynaptic.com"
+DOMAIN_SERVER: "https://chat.heysynaptic.com"
+APP_TITLE: "HeyJones"
+CONSOLE_JSON: "true"
+DEBUG_LOGGING: "true"
+
+#===================================================#
+#                    User System                    #
+#===================================================#
+# --- Feature Flags & Auth Settings ---
+SEARCH: "true"
+ALLOW_PASSWORD_RESET: "true"
+REGISTRATION_ENABLED: "true"
+ALLOW_REGISTRATION: "true"
+ALLOW_SOCIAL_LOGIN: "true"
+
+# --- Conversation Title Settings ---
+TITLE_CONVO: "true"
+OPENAI_TITLE_MODEL: "gpt-4o"
+OPENAI_SUMMARIZE: "true"
+OPENAI_SUMMARY_MODEL: "gpt-4o"
+
+# --- Moderation/Rate Limiting (Defaults are used if commented out) ---
+# See docs for more info: https://www.librechat.ai/docs/configuration/user_system/rate_limiting
+# BAN_VIOLATIONS: "true"
+# BAN_DURATION: "7200000" # 2 hours
+# LOGIN_MAX: "7"
+# LOGIN_WINDOW: "5"
+# REGISTER_MAX: "5"
+# REGISTER_WINDOW: "60"
+# LIMIT_CONCURRENT_MESSAGES: "true"
+# CONCURRENT_MESSAGE_MAX: "2"
+# LIMIT_MESSAGE_IP: "true"
+# MESSAGE_IP_MAX: "40"
+# MESSAGE_IP_WINDOW: "1"
+
+#===================================================#
+#                Email Configuration                #
+#===================================================#
+EMAIL_ENABLED: "true"
+EMAIL_PROVIDER: "smtp"
+EMAIL_HOST: "smtp.postmarkapp.com"
+EMAIL_PORT: "587"
+EMAIL_USERNAME: "32495314-59ee-4004-8ec2-c3595a4df893"
+EMAIL_FROM: "noreply@heysynaptic.com"
+
+#===================================================#
+#                 Model Definitions                 #
+#===================================================#
+GOOGLE_MODELS: "gemini-2.5-pro-preview-05-06,gemini-2.5-flash-preview-04-17,gemini-2.0-flash-001,gemini-2.0-flash-exp,gemini-2.0-flash-lite-001,gemini-1.5-pro-002,gemini-1.5-flash-002"
+OPENAI_MODELS: "o3,o3-mini,o4-mini,gpt-4o"
+ANTHROPIC_MODELS: "claude-sonnet-4-20250514,claude-opus-4-20250514"
+GROQ_MODELS: "llama3-70b-8192,gemma-7b-it"
