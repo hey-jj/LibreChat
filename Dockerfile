@@ -1,42 +1,44 @@
-# Stage 1: Base image with production-grade tools
-FROM node:20-alpine AS base
-RUN apk add --no-cache jemalloc uv
-ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
+# STAGE 1: BUILDER
+# This stage installs all dependencies (including dev) and builds the application source code
+FROM node:20-alpine AS builder
 WORKDIR /app
 
-# Stage 2: Builder - This stage will install all dependencies and build the app
-FROM base AS builder
-COPY package.json package-lock.json* ./
+# Copy the entire source code first
+COPY . .
 
 # Set resilient npm config for CI/CD environments
 RUN npm config set fetch-retry-maxtimeout 600000 && \
     npm config set fetch-retries 5 && \
     npm config set fetch-retry-mintimeout 15000
 
-# Install ALL dependencies (including devDependencies like 'rimraf' and 'rollup')
+# Install ALL dependencies now that all package.json files are present
 RUN npm install
 
-# Copy the entire application source code
-COPY . .
-
-# This temporary variable is required ONLY for the build script to succeed.
+# This temporary variable is required ONLY for the build script to succeed
 ENV MONGO_URI="mongodb://temp"
 
-# Run the build script. It now has access to all required dev dependencies.
+# Run the build script, which now has access to all required dev dependencies
 RUN NODE_OPTIONS="--max-old-space-size=4096" npm run frontend
 
-# Stage 3: Final production image
-FROM base AS production
+# Also, prune dev dependencies from the node_modules in this stage for the next copy
+RUN npm prune --production
+
+
+# STAGE 2: PRODUCTION
+# This stage creates the final, lean image for running the application
+FROM node:20-alpine AS production
+WORKDIR /app
+
+# Install jemalloc for performance, as in the official Dockerfile
+RUN apk add --no-cache jemalloc
+ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
 ENV NODE_ENV=production
 
-# Copy only the necessary files for a lean production image
-COPY package.json .
-# Install ONLY production dependencies, creating a clean, small node_modules folder
-RUN npm install --omit=dev
-
+# Copy the pruned, production-only node_modules from the builder stage
+COPY --from=builder /app/node_modules ./node_modules
 # Copy the built application code from the builder stage
 COPY --from=builder /app/api/dist ./api/dist
-COPY --from=builder /app/packages/data-provider/dist ./packages/data-provider/dist
+COPY --from=builder /app/package.json .
 
 # Copy the Firebase Service Account Key into the final image
 COPY firebase-service-account-key.json /app/firebase-service-account-key.json
