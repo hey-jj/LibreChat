@@ -47,7 +47,7 @@ EMAIL_ENABLED: "true"
 EMAIL_PROVIDER: "smtp"
 EMAIL_HOST: "smtp.postmarkapp.com"
 EMAIL_PORT: "587"
-EMAIL_USERNAME: "32495314-59ee-4004-8ec2-c3595a4df893"
+# EMAIL_USERNAME is now provided via a secret
 EMAIL_FROM: "noreply@heysynaptic.com"
 
 #===================================================#
