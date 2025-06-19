@@ -31,12 +31,11 @@ RUN apk add --no-cache jemalloc
 ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
 ENV NODE_ENV=production
 
-# Copy necessary package files to run install
+# Copy the main package.json to run scripts from the root
 COPY --from=builder /app/package.json .
-COPY --from=builder /app/packages/api/package.json ./packages/api/
 
-# Re-install ONLY production dependencies to create a clean, small node_modules folder
-RUN npm install --omit=dev
+# Re-install ONLY production dependencies, AND the cross-env tool needed by the start script
+RUN npm install --omit=dev cross-env
 
 # Copy the built application code from the builder stage
 COPY --from=builder /app/packages/data-provider/dist ./packages/data-provider/dist
@@ -50,5 +49,5 @@ ENV GOOGLE_APPLICATION_CREDENTIALS /app/firebase-service-account-key.json
 
 EXPOSE 8080
 
-# CORRECTED: Point to index.js, which is the actual output of the build process.
-CMD ["node", "packages/api/dist/index.js"]
+# CORRECTED: Use the official backend start script.
+CMD ["npm", "run", "backend"]
