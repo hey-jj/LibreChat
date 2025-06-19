@@ -17,7 +17,7 @@ RUN npm install
 # This temporary variable is required ONLY for the build script to succeed
 ENV MONGO_URI="mongodb://temp"
 
-# Run the build script, which has access to all required dev dependencies
+# Run the build script
 RUN NODE_OPTIONS="--max-old-space-size=4096" npm run frontend
 
 
@@ -31,10 +31,9 @@ RUN apk add --no-cache jemalloc
 ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
 ENV NODE_ENV=production
 
-# Copy the main package.json to run scripts from the root
+# Copy necessary package files
 COPY --from=builder /app/package.json .
-# Also copy the package.json from the api workspace
-COPY --from=builder /app/packages/api/package.json ./packages/api/package.json
+COPY --from=builder /app/packages/api/package.json ./packages/api/
 
 # Re-install ONLY production dependencies to create a clean, small node_modules folder
 RUN npm install --omit=dev
@@ -51,5 +50,6 @@ ENV GOOGLE_APPLICATION_CREDENTIALS /app/firebase-service-account-key.json
 
 EXPOSE 8080
 
-# CORRECTED: Run the backend script from the project root, where npm can find the workspaces.
-CMD ["npm", "run", "backend"]
+# CORRECTED: Run the server directly with node, bypassing the problematic npm script.
+# The working directory is already /app, and the main server file is at packages/api/dist/server.js
+CMD ["node", "packages/api/dist/server.js"]
