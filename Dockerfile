@@ -17,11 +17,8 @@ RUN npm install
 # This temporary variable is required ONLY for the build script to succeed
 ENV MONGO_URI="mongodb://temp"
 
-# Run the build script
+# Run the build script, which has access to all required dev dependencies
 RUN NODE_OPTIONS="--max-old-space-size=4096" npm run frontend
-
-# Prune dev dependencies from the node_modules for a smaller final image
-RUN npm prune --production
 
 
 # STAGE 2: PRODUCTION
@@ -34,26 +31,25 @@ RUN apk add --no-cache jemalloc
 ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
 ENV NODE_ENV=production
 
-# Copy the pruned, production-only node_modules from the builder stage
-COPY --from=builder /app/node_modules ./node_modules
-# Copy the main package.json
+# Copy the main package.json to run scripts from the root
 COPY --from=builder /app/package.json .
+# Also copy the package.json from the api workspace
+COPY --from=builder /app/packages/api/package.json ./packages/api/package.json
 
-# CORRECTED: Copy all necessary built packages from the builder stage
+# Re-install ONLY production dependencies to create a clean, small node_modules folder
+RUN npm install --omit=dev
+
+# Copy the built application code from the builder stage
 COPY --from=builder /app/packages/data-provider/dist ./packages/data-provider/dist
 COPY --from=builder /app/packages/data-schemas/dist ./packages/data-schemas/dist
 COPY --from=builder /app/packages/api/dist ./packages/api/dist
-
 
 # Copy the Firebase Service Account Key into the final image
 COPY firebase-service-account-key.json /app/firebase-service-account-key.json
 # Set the standard Google credential variable to point to the file path
 ENV GOOGLE_APPLICATION_CREDENTIALS /app/firebase-service-account-key.json
 
-# The working directory for the final container is the built api package
-WORKDIR /app/packages/api
 EXPOSE 8080
 
-# The command to start the backend server, which now needs to be run from the root
-# using -w flag to specify the workspace.
-CMD ["npm", "run", "backend", "-w", "@librechat/api"]
+# CORRECTED: Run the backend script from the project root, where npm can find the workspaces.
+CMD ["npm", "run", "backend"]
