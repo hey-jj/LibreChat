@@ -3,7 +3,7 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 
-# Copy all source code first
+# Copy the entire source code first
 COPY . .
 
 # Set resilient npm config
@@ -11,7 +11,7 @@ RUN npm config set fetch-retry-maxtimeout 600000 && \
     npm config set fetch-retries 5 && \
     npm config set fetch-retry-mintimeout 15000
 
-# Install ALL dependencies for all workspaces
+# Install ALL dependencies for the build
 RUN npm install
 
 # This temporary variable is required ONLY for the build script to succeed
@@ -31,16 +31,26 @@ RUN apk add --no-cache jemalloc
 ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
 ENV NODE_ENV=production
 
-# Copy the entire built application, including all packages and node_modules, from the builder stage.
-# This ensures all workspace packages and dependencies are present with the correct paths.
-COPY --from=builder /app .
+# Copy necessary package files
+COPY --from=builder /app/package.json .
+COPY --from=builder /app/packages/api/package.json ./packages/api/
+COPY --from=builder /app/packages/data-provider/package.json ./packages/data-provider/
+COPY --from=builder /app/packages/data-schemas/package.json ./packages/data-schemas/
 
-# The Firebase key is copied from the build context, where it's provided by Cloud Build
+# Install production dependencies, then explicitly install cross-env
+RUN npm install --omit=dev && npm install cross-env
+
+# Copy the built application code from the builder stage
+COPY --from=builder /app/packages/data-provider/dist ./packages/data-provider/dist
+COPY --from=builder /app/packages/data-schemas/dist ./packages/data-schemas/dist
+COPY --from=builder /app/packages/api/dist ./packages/api/dist
+
+# Copy the Firebase Service Account Key into the final image
 COPY firebase-service-account-key.json /app/firebase-service-account-key.json
 ENV GOOGLE_APPLICATION_CREDENTIALS /app/firebase-service-account-key.json
 
 EXPOSE 8080
 
-# Run the server directly using the final, built entrypoint.
-# The working directory is now the project root (/app).
-CMD ["node", "./packages/api/dist/index.js"]
+# DEFINITIVE CMD: Use the official backend start script.
+# With `cross-env` now installed, this will succeed.
+CMD ["npm", "run", "backend"]
