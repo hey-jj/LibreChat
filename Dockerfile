@@ -20,6 +20,9 @@ ENV MONGO_URI="mongodb://temp"
 # Run the build script
 RUN NODE_OPTIONS="--max-old-space-size=4096" npm run frontend
 
+# Prune dev dependencies from the node_modules folder AFTER the build is complete
+RUN npm prune --production
+
 
 # STAGE 2: PRODUCTION
 # This stage creates the final, lean image for running the application
@@ -31,15 +34,15 @@ RUN apk add --no-cache jemalloc
 ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
 ENV NODE_ENV=production
 
-# Copy necessary package files
-COPY --from=builder /app/package.json .
-# Re-install ONLY production dependencies
-RUN npm install --omit=dev
+# Copy the pruned, production-only node_modules from the builder stage
+COPY --from=builder /app/node_modules ./node_modules
 
-# Copy all built code into a single, unified structure
+# Copy all necessary built packages from the builder stage
 COPY --from=builder /app/packages/data-provider/dist ./packages/data-provider/dist
 COPY --from=builder /app/packages/data-schemas/dist ./packages/data-schemas/dist
 COPY --from=builder /app/packages/api/dist ./packages/api/dist
+COPY --from=builder /app/package.json .
+COPY --from=builder /app/packages/api/package.json ./packages/api/
 
 # Copy the Firebase Service Account Key into the final image
 COPY firebase-service-account-key.json /app/firebase-service-account-key.json
@@ -48,6 +51,5 @@ ENV GOOGLE_APPLICATION_CREDENTIALS /app/firebase-service-account-key.json
 
 EXPOSE 8080
 
-# DEFINITIVE CMD: Run node directly on the correct, built server entrypoint file.
-# This bypasses all npm script complexities (like cross-env).
-CMD ["node", "./packages/api/dist/index.js"]
+# Run node directly on the correct, built server entrypoint file.
+CMD ["node", "packages/api/dist/index.js"]
