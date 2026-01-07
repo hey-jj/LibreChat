@@ -1,20 +1,17 @@
-import type OpenAI from 'openai';
 import type { InfiniteData } from '@tanstack/react-query';
 import type {
-  TBanner,
-  TMessage,
-  TResPlugin,
-  TSharedLink,
-  TConversation,
-  EModelEndpoint,
   TConversationTag,
+  EModelEndpoint,
+  TConversation,
+  TSharedLink,
   TAttachment,
+  TMessage,
+  TBanner,
 } from './schemas';
 import type { SettingDefinition } from './generate';
 import type { TMinimalFeedback } from './feedback';
+import type { ContentTypes } from './types/runs';
 import type { Agent } from './types/assistants';
-
-export type TOpenAIMessage = OpenAI.Chat.ChatCompletionMessageParam;
 
 export * from './schemas';
 
@@ -43,6 +40,7 @@ export type TEndpointOption = Pick<
   | 'resendFiles'
   | 'imageDetail'
   | 'reasoning_effort'
+  | 'verbosity'
   | 'instructions'
   | 'additional_instructions'
   | 'append_current_datetime'
@@ -98,34 +96,50 @@ export type TEndpointOption = Pick<
 export type TEphemeralAgent = {
   mcp?: string[];
   web_search?: boolean;
+  file_search?: boolean;
   execute_code?: boolean;
 };
 
 export type TPayload = Partial<TMessage> &
   Partial<TEndpointOption> & {
     isContinued: boolean;
+    isRegenerate?: boolean;
     conversationId: string | null;
     messages?: TMessages;
     isTemporary: boolean;
     ephemeralAgent?: TEphemeralAgent | null;
+    editedContent?: TEditedContent | null;
+    /** Added conversation for multi-convo feature */
+    addedConvo?: TConversation;
   };
 
+export type TEditedContent =
+  | {
+      index: number;
+      type: ContentTypes.THINK;
+      [ContentTypes.THINK]: string;
+    }
+  | {
+      index: number;
+      type: ContentTypes.TEXT;
+      [ContentTypes.TEXT]: string;
+    };
+
 export type TSubmission = {
-  artifacts?: string;
-  plugin?: TResPlugin;
-  plugins?: TResPlugin[];
   userMessage: TMessage;
   isEdited?: boolean;
   isContinued?: boolean;
   isTemporary: boolean;
   messages: TMessage[];
   isRegenerate?: boolean;
-  isResubmission?: boolean;
   initialResponse?: TMessage;
   conversation: Partial<TConversation>;
   endpointOption: TEndpointOption;
   clientTimestamp?: string;
   ephemeralAgent?: TEphemeralAgent | null;
+  editedContent?: TEditedContent | null;
+  /** Added conversation for multi-convo feature */
+  addedConvo?: TConversation;
 };
 
 export type EventSubmission = Omit<TSubmission, 'initialResponse'> & { initialResponse: TMessage };
@@ -133,7 +147,7 @@ export type EventSubmission = Omit<TSubmission, 'initialResponse'> & { initialRe
 export type TPluginAction = {
   pluginKey: string;
   action: 'install' | 'uninstall';
-  auth?: Partial<Record<string, string>>;
+  auth?: Partial<Record<string, string>> | null;
   isEntityTool?: boolean;
 };
 
@@ -143,7 +157,7 @@ export type TUpdateUserPlugins = {
   isEntityTool?: boolean;
   pluginKey: string;
   action: string;
-  auth?: Partial<Record<string, string | null>>;
+  auth?: Partial<Record<string, string | null>> | null;
 };
 
 // TODO `label` needs to be changed to the proper `TranslationKeys`
@@ -151,6 +165,12 @@ export type TCategory = {
   id?: string;
   value: string;
   label: string;
+  description?: string;
+  custom?: boolean;
+};
+
+export type TMarketplaceCategory = TCategory & {
+  count: number;
 };
 
 export type TError = {
@@ -328,7 +348,7 @@ export type TConfig = {
   capabilities?: string[];
   customParams?: {
     defaultParamsEndpoint?: string;
-    paramDefinitions?: SettingDefinition[];
+    paramDefinitions?: Partial<SettingDefinition>[];
   };
 };
 
@@ -403,6 +423,14 @@ export type TVerify2FATempResponse = {
   token?: string;
   user?: TUser;
   message?: string;
+};
+
+/**
+ * Request for disabling 2FA.
+ */
+export type TDisable2FARequest = {
+  token?: string;
+  backupCode?: string;
 };
 
 /**
@@ -509,8 +537,10 @@ export type TPromptsWithFilterRequest = {
 
 export type TPromptGroupsWithFilterRequest = {
   category: string;
-  pageNumber: string;
-  pageSize: string | number;
+  pageNumber?: string; // Made optional for cursor-based pagination
+  pageSize?: string | number;
+  limit?: string | number; // For cursor-based pagination
+  cursor?: string; // For cursor-based pagination
   before?: string | null;
   after?: string | null;
   order?: 'asc' | 'desc';
@@ -523,6 +553,8 @@ export type PromptGroupListResponse = {
   pageNumber: string;
   pageSize: string | number;
   pages: string | number;
+  has_more: boolean; // Added for cursor-based pagination
+  after: string | null; // Added for cursor-based pagination
 };
 
 export type PromptGroupListData = InfiniteData<PromptGroupListResponse>;

@@ -1,17 +1,29 @@
 import { EventEmitter } from 'events';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { logger } from '@librechat/data-schemas';
+import { fetch as undiciFetch, Agent } from 'undici';
 import {
   StdioClientTransport,
   getDefaultEnvironment,
 } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { WebSocketClientTransport } from '@modelcontextprotocol/sdk/client/websocket.js';
 import { ResourceListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
-import type { Logger } from 'winston';
+import type {
+  RequestInit as UndiciRequestInit,
+  RequestInfo as UndiciRequestInfo,
+  Response as UndiciResponse,
+} from 'undici';
+import type { MCPOAuthTokens } from './oauth/types';
+import { withTimeout } from '~/utils/promise';
 import type * as t from './types';
+import { sanitizeUrlForLogging } from './utils';
+import { mcpConfig } from './mcpConfig';
+
+type FetchLike = (url: string | URL, init?: RequestInit) => Promise<Response>;
 
 function isStdioOptions(options: t.MCPOptions): options is t.StdioOptions {
   return 'command' in options;
@@ -44,47 +56,220 @@ function isSSEOptions(options: t.MCPOptions): options is t.SSEOptions {
  * @returns True if options are for a streamable HTTP transport
  */
 function isStreamableHTTPOptions(options: t.MCPOptions): options is t.StreamableHTTPOptions {
-  if ('url' in options && options.type === 'streamable-http') {
-    const protocol = new URL(options.url).protocol;
-    return protocol !== 'ws:' && protocol !== 'wss:';
+  if ('url' in options && 'type' in options) {
+    const optionType = options.type as string;
+    if (optionType === 'streamable-http' || optionType === 'http') {
+      const protocol = new URL(options.url).protocol;
+      return protocol !== 'ws:' && protocol !== 'wss:';
+    }
   }
   return false;
 }
 
 const FIVE_MINUTES = 5 * 60 * 1000;
+const DEFAULT_TIMEOUT = 60000;
+/** SSE connections through proxies may need longer initial handshake time */
+const SSE_CONNECT_TIMEOUT = 120000;
+
+/**
+ * Headers for SSE connections.
+ *
+ * Headers we intentionally DO NOT include:
+ * - Accept: text/event-stream - Already set by eventsource library AND MCP SDK
+ * - X-Accel-Buffering: This is a RESPONSE header for Nginx, not a request header.
+ *   The upstream MCP server must send this header for Nginx to respect it.
+ * - Connection: keep-alive: Forbidden in HTTP/2 (RFC 7540 §8.1.2.2).
+ *   HTTP/2 manages connection persistence differently.
+ */
+const SSE_REQUEST_HEADERS = {
+  'Cache-Control': 'no-cache',
+};
+
+/**
+ * Extracts a meaningful error message from SSE transport errors.
+ * The MCP SDK's SSEClientTransport can produce "SSE error: undefined" when the
+ * underlying eventsource library encounters connection issues without a specific message.
+ *
+ * @returns Object containing:
+ *   - message: Human-readable error description
+ *   - code: HTTP status code if available
+ *   - isProxyHint: Whether this error suggests proxy misconfiguration
+ *   - isTransient: Whether this is likely a transient error that will auto-reconnect
+ */
+function extractSSEErrorMessage(error: unknown): {
+  message: string;
+  code?: number;
+  isProxyHint: boolean;
+  isTransient: boolean;
+} {
+  if (!error || typeof error !== 'object') {
+    return {
+      message: 'Unknown SSE transport error',
+      isProxyHint: true,
+      isTransient: true,
+    };
+  }
+
+  const errorObj = error as { message?: string; code?: number; event?: unknown };
+  const rawMessage = errorObj.message ?? '';
+  const code = errorObj.code;
+
+  /**
+   * Handle the common "SSE error: undefined" case.
+   * This typically occurs when:
+   * 1. A reverse proxy buffers the SSE stream (proxy issue)
+   * 2. The server closes an idle connection (normal SSE behavior)
+   * 3. Network interruption without specific error details
+   *
+   * In all cases, the eventsource library will attempt to reconnect automatically.
+   */
+  if (rawMessage === 'SSE error: undefined' || rawMessage === 'undefined' || !rawMessage) {
+    return {
+      message:
+        'SSE connection closed. This can occur due to: (1) idle connection timeout (normal), ' +
+        '(2) reverse proxy buffering (check proxy_buffering config), or (3) network interruption.',
+      code,
+      isProxyHint: true,
+      isTransient: true,
+    };
+  }
+
+  /**
+   * Check for timeout patterns. Use case-insensitive matching for common timeout error codes:
+   * - ETIMEDOUT: TCP connection timeout
+   * - ESOCKETTIMEDOUT: Socket timeout
+   * - "timed out" / "timeout": Generic timeout messages
+   */
+  const lowerMessage = rawMessage.toLowerCase();
+  if (
+    rawMessage.includes('ETIMEDOUT') ||
+    rawMessage.includes('ESOCKETTIMEDOUT') ||
+    lowerMessage.includes('timed out') ||
+    lowerMessage.includes('timeout after') ||
+    lowerMessage.includes('request timeout')
+  ) {
+    return {
+      message: `SSE connection timed out: ${rawMessage}. If behind a reverse proxy, increase proxy_read_timeout.`,
+      code,
+      isProxyHint: true,
+      isTransient: true,
+    };
+  }
+
+  // Connection reset is often transient (server restart, proxy reload)
+  if (rawMessage.includes('ECONNRESET')) {
+    return {
+      message: `SSE connection reset: ${rawMessage}. The server or proxy may have restarted.`,
+      code,
+      isProxyHint: false,
+      isTransient: true,
+    };
+  }
+
+  // Connection refused is more serious - server may be down
+  if (rawMessage.includes('ECONNREFUSED')) {
+    return {
+      message: `SSE connection refused: ${rawMessage}. Verify the MCP server is running and accessible.`,
+      code,
+      isProxyHint: false,
+      isTransient: false,
+    };
+  }
+
+  // DNS failure is usually a configuration issue, not transient
+  if (rawMessage.includes('ENOTFOUND') || rawMessage.includes('getaddrinfo')) {
+    return {
+      message: `SSE DNS resolution failed: ${rawMessage}. Check the server URL is correct.`,
+      code,
+      isProxyHint: false,
+      isTransient: false,
+    };
+  }
+
+  // Check for HTTP status codes in the message
+  const statusMatch = rawMessage.match(/\b(4\d{2}|5\d{2})\b/);
+  if (statusMatch) {
+    const statusCode = parseInt(statusMatch[1], 10);
+    // 5xx errors are often transient, 4xx are usually not
+    const isServerError = statusCode >= 500 && statusCode < 600;
+    return {
+      message: rawMessage,
+      code: statusCode,
+      isProxyHint: statusCode === 502 || statusCode === 503 || statusCode === 504,
+      isTransient: isServerError,
+    };
+  }
+
+  return {
+    message: rawMessage,
+    code,
+    isProxyHint: false,
+    isTransient: false,
+  };
+}
+
+interface MCPConnectionParams {
+  serverName: string;
+  serverConfig: t.MCPOptions;
+  userId?: string;
+  oauthTokens?: MCPOAuthTokens | null;
+}
+
 export class MCPConnection extends EventEmitter {
-  private static instance: MCPConnection | null = null;
   public client: Client;
+  private options: t.MCPOptions;
   private transport: Transport | null = null; // Make this nullable
   private connectionState: t.ConnectionState = 'disconnected';
   private connectPromise: Promise<void> | null = null;
-  private lastError: Error | null = null;
-  private lastConfigUpdate = 0;
-  private readonly CONFIG_TTL = 5 * 60 * 1000; // 5 minutes
   private readonly MAX_RECONNECT_ATTEMPTS = 3;
   public readonly serverName: string;
   private shouldStopReconnecting = false;
   private isReconnecting = false;
   private isInitializing = false;
   private reconnectAttempts = 0;
-  iconPath?: string;
-  timeout?: number;
   private readonly userId?: string;
   private lastPingTime: number;
+  private lastConnectionCheckAt: number = 0;
+  private oauthTokens?: MCPOAuthTokens | null;
+  private requestHeaders?: Record<string, string> | null;
+  private oauthRequired = false;
+  iconPath?: string;
+  timeout?: number;
+  url?: string;
 
-  constructor(
-    serverName: string,
-    private readonly options: t.MCPOptions,
-    private logger?: Logger,
-    userId?: string,
-  ) {
+  /**
+   * Timestamp when this connection was created.
+   * Used to detect if connection is stale compared to updated config.
+   */
+  public readonly createdAt: number;
+
+  setRequestHeaders(headers: Record<string, string> | null): void {
+    if (!headers) {
+      return;
+    }
+    const normalizedHeaders: Record<string, string> = {};
+    for (const [key, value] of Object.entries(headers)) {
+      normalizedHeaders[key.toLowerCase()] = value;
+    }
+    this.requestHeaders = normalizedHeaders;
+  }
+
+  getRequestHeaders(): Record<string, string> | null | undefined {
+    return this.requestHeaders;
+  }
+
+  constructor(params: MCPConnectionParams) {
     super();
-    this.serverName = serverName;
-    this.logger = logger;
-    this.userId = userId;
-    this.iconPath = options.iconPath;
-    this.timeout = options.timeout;
+    this.options = params.serverConfig;
+    this.serverName = params.serverName;
+    this.userId = params.userId;
+    this.iconPath = params.serverConfig.iconPath;
+    this.timeout = params.serverConfig.timeout;
     this.lastPingTime = Date.now();
+    this.createdAt = Date.now(); // Record creation timestamp for staleness detection
+    if (params.oauthTokens) {
+      this.oauthTokens = params.oauthTokens;
+    }
     this.client = new Client(
       {
         name: '@librechat/api-client',
@@ -104,33 +289,57 @@ export class MCPConnection extends EventEmitter {
     return `[MCP]${userPart}[${this.serverName}]`;
   }
 
-  public static getInstance(
-    serverName: string,
-    options: t.MCPOptions,
-    logger?: Logger,
-    userId?: string,
-  ): MCPConnection {
-    if (!MCPConnection.instance) {
-      MCPConnection.instance = new MCPConnection(serverName, options, logger, userId);
-    }
-    return MCPConnection.instance;
-  }
+  /**
+   * Factory function to create fetch functions without capturing the entire `this` context.
+   * This helps prevent memory leaks by only passing necessary dependencies.
+   *
+   * @param getHeaders Function to retrieve request headers
+   * @param timeout Timeout value for the agent (in milliseconds)
+   * @returns A fetch function that merges headers appropriately
+   */
+  private createFetchFunction(
+    getHeaders: () => Record<string, string> | null | undefined,
+    timeout?: number,
+  ): (input: UndiciRequestInfo, init?: UndiciRequestInit) => Promise<UndiciResponse> {
+    return function customFetch(
+      input: UndiciRequestInfo,
+      init?: UndiciRequestInit,
+    ): Promise<UndiciResponse> {
+      const requestHeaders = getHeaders();
+      const effectiveTimeout = timeout || DEFAULT_TIMEOUT;
+      const agent = new Agent({
+        bodyTimeout: effectiveTimeout,
+        headersTimeout: effectiveTimeout,
+      });
+      if (!requestHeaders) {
+        return undiciFetch(input, { ...init, dispatcher: agent });
+      }
 
-  public static getExistingInstance(): MCPConnection | null {
-    return MCPConnection.instance;
-  }
+      let initHeaders: Record<string, string> = {};
+      if (init?.headers) {
+        if (init.headers instanceof Headers) {
+          initHeaders = Object.fromEntries(init.headers.entries());
+        } else if (Array.isArray(init.headers)) {
+          initHeaders = Object.fromEntries(init.headers);
+        } else {
+          initHeaders = init.headers as Record<string, string>;
+        }
+      }
 
-  public static async destroyInstance(): Promise<void> {
-    if (MCPConnection.instance) {
-      await MCPConnection.instance.disconnect();
-      MCPConnection.instance = null;
-    }
+      return undiciFetch(input, {
+        ...init,
+        headers: {
+          ...initHeaders,
+          ...requestHeaders,
+        },
+        dispatcher: agent,
+      });
+    };
   }
 
   private emitError(error: unknown, errorContext: string): void {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    this.logger?.error(`${this.getLogPrefix()} ${errorContext}: ${errorMessage}`);
-    this.emit('error', new Error(`${errorContext}: ${errorMessage}`));
+    logger.error(`${this.getLogPrefix()} ${errorContext}: ${errorMessage}`);
   }
 
   private constructTransport(options: t.MCPOptions): Transport {
@@ -141,6 +350,7 @@ export class MCPConnection extends EventEmitter {
       } else if (isWebSocketOptions(options)) {
         type = 'websocket';
       } else if (isStreamableHTTPOptions(options)) {
+        // Could be either 'streamable-http' or 'http', normalize to 'streamable-http'
         type = 'streamable-http';
       } else if (isSSEOptions(options)) {
         type = 'sse';
@@ -167,45 +377,70 @@ export class MCPConnection extends EventEmitter {
           if (!isWebSocketOptions(options)) {
             throw new Error('Invalid options for websocket transport.');
           }
+          this.url = options.url;
           return new WebSocketClientTransport(new URL(options.url));
 
         case 'sse': {
           if (!isSSEOptions(options)) {
             throw new Error('Invalid options for sse transport.');
           }
+          this.url = options.url;
           const url = new URL(options.url);
-          this.logger?.info(`${this.getLogPrefix()} Creating SSE transport: ${url.toString()}`);
+          logger.info(
+            `${this.getLogPrefix()} Creating SSE transport: ${sanitizeUrlForLogging(url)}`,
+          );
           const abortController = new AbortController();
+
+          /** Add OAuth token to headers if available */
+          const headers = { ...options.headers };
+          if (this.oauthTokens?.access_token) {
+            headers['Authorization'] = `Bearer ${this.oauthTokens.access_token}`;
+          }
+
+          /**
+           * SSE connections need longer timeouts for reliability.
+           * The connect timeout is extended because proxies may delay initial response.
+           */
+          const sseTimeout = this.timeout || SSE_CONNECT_TIMEOUT;
           const transport = new SSEClientTransport(url, {
             requestInit: {
-              headers: options.headers,
+              /** User/OAuth headers override SSE defaults */
+              headers: { ...SSE_REQUEST_HEADERS, ...headers },
               signal: abortController.signal,
             },
             eventSourceInit: {
               fetch: (url, init) => {
-                const headers = new Headers(Object.assign({}, init?.headers, options.headers));
-                return fetch(url, {
+                /** Merge headers: SSE defaults < init headers < user headers (user wins) */
+                const fetchHeaders = new Headers(
+                  Object.assign({}, SSE_REQUEST_HEADERS, init?.headers, headers),
+                );
+                const agent = new Agent({
+                  bodyTimeout: sseTimeout,
+                  headersTimeout: sseTimeout,
+                  /** Extended keep-alive for long-lived SSE connections */
+                  keepAliveTimeout: sseTimeout,
+                  keepAliveMaxTimeout: sseTimeout * 2,
+                });
+                return undiciFetch(url, {
                   ...init,
-                  headers,
+                  dispatcher: agent,
+                  headers: fetchHeaders,
                 });
               },
             },
+            fetch: this.createFetchFunction(
+              this.getRequestHeaders.bind(this),
+              sseTimeout,
+            ) as unknown as FetchLike,
           });
 
           transport.onclose = () => {
-            this.logger?.info(`${this.getLogPrefix()} SSE transport closed`);
+            logger.info(`${this.getLogPrefix()} SSE transport closed`);
             this.emit('connectionChange', 'disconnected');
           };
 
-          transport.onerror = (error) => {
-            this.logger?.error(`${this.getLogPrefix()} SSE transport error:`, error);
-            this.emitError(error, 'SSE transport error:');
-          };
-
           transport.onmessage = (message) => {
-            this.logger?.info(
-              `${this.getLogPrefix()} Message received: ${JSON.stringify(message)}`,
-            );
+            logger.info(`${this.getLogPrefix()} Message received: ${JSON.stringify(message)}`);
           };
 
           this.setupTransportErrorHandlers(transport);
@@ -216,33 +451,37 @@ export class MCPConnection extends EventEmitter {
           if (!isStreamableHTTPOptions(options)) {
             throw new Error('Invalid options for streamable-http transport.');
           }
+          this.url = options.url;
           const url = new URL(options.url);
-          this.logger?.info(
-            `${this.getLogPrefix()} Creating streamable-http transport: ${url.toString()}`,
+          logger.info(
+            `${this.getLogPrefix()} Creating streamable-http transport: ${sanitizeUrlForLogging(url)}`,
           );
           const abortController = new AbortController();
 
+          /** Add OAuth token to headers if available */
+          const headers = { ...options.headers };
+          if (this.oauthTokens?.access_token) {
+            headers['Authorization'] = `Bearer ${this.oauthTokens.access_token}`;
+          }
+
           const transport = new StreamableHTTPClientTransport(url, {
             requestInit: {
-              headers: options.headers,
+              headers,
               signal: abortController.signal,
             },
+            fetch: this.createFetchFunction(
+              this.getRequestHeaders.bind(this),
+              this.timeout,
+            ) as unknown as FetchLike,
           });
 
           transport.onclose = () => {
-            this.logger?.info(`${this.getLogPrefix()} Streamable-http transport closed`);
+            logger.info(`${this.getLogPrefix()} Streamable-http transport closed`);
             this.emit('connectionChange', 'disconnected');
           };
 
-          transport.onerror = (error: Error | unknown) => {
-            this.logger?.error(`${this.getLogPrefix()} Streamable-http transport error:`, error);
-            this.emitError(error, 'Streamable-http transport error:');
-          };
-
           transport.onmessage = (message: JSONRPCMessage) => {
-            this.logger?.info(
-              `${this.getLogPrefix()} Message received: ${JSON.stringify(message)}`,
-            );
+            logger.info(`${this.getLogPrefix()} Message received: ${JSON.stringify(message)}`);
           };
 
           this.setupTransportErrorHandlers(transport);
@@ -254,7 +493,7 @@ export class MCPConnection extends EventEmitter {
         }
       }
     } catch (error) {
-      this.emitError(error, 'Failed to construct transport:');
+      this.emitError(error, 'Failed to construct transport');
       throw error;
     }
   }
@@ -271,17 +510,17 @@ export class MCPConnection extends EventEmitter {
         /**
          * // FOR DEBUGGING
          * // this.client.setRequestHandler(PingRequestSchema, async (request, extra) => {
-         * //    this.logger?.info(`[MCP][${this.serverName}] PingRequest: ${JSON.stringify(request)}`);
+         * //    logger.info(`[MCP][${this.serverName}] PingRequest: ${JSON.stringify(request)}`);
          * //    if (getEventListeners && extra.signal) {
          * //      const listenerCount = getEventListeners(extra.signal, 'abort').length;
-         * //      this.logger?.debug(`Signal has ${listenerCount} abort listeners`);
+         * //      logger.debug(`Signal has ${listenerCount} abort listeners`);
          * //    }
          * //    return {};
          * //  });
          */
       } else if (state === 'error' && !this.isReconnecting && !this.isInitializing) {
         this.handleReconnection().catch((error) => {
-          this.logger?.error(`${this.getLogPrefix()} Reconnection handler failed:`, error);
+          logger.error(`${this.getLogPrefix()} Reconnection handler failed:`, error);
         });
       }
     });
@@ -290,7 +529,15 @@ export class MCPConnection extends EventEmitter {
   }
 
   private async handleReconnection(): Promise<void> {
-    if (this.isReconnecting || this.shouldStopReconnecting || this.isInitializing) {
+    if (
+      this.isReconnecting ||
+      this.shouldStopReconnecting ||
+      this.isInitializing ||
+      this.oauthRequired
+    ) {
+      if (this.oauthRequired) {
+        logger.info(`${this.getLogPrefix()} OAuth required, skipping reconnection attempts`);
+      }
       return;
     }
 
@@ -305,7 +552,7 @@ export class MCPConnection extends EventEmitter {
         this.reconnectAttempts++;
         const delay = backoffDelay(this.reconnectAttempts);
 
-        this.logger?.info(
+        logger.info(
           `${this.getLogPrefix()} Reconnecting ${this.reconnectAttempts}/${this.MAX_RECONNECT_ATTEMPTS} (delay: ${delay}ms)`,
         );
 
@@ -316,13 +563,31 @@ export class MCPConnection extends EventEmitter {
           this.reconnectAttempts = 0;
           return;
         } catch (error) {
-          this.logger?.error(`${this.getLogPrefix()} Reconnection attempt failed:`, error);
+          logger.error(`${this.getLogPrefix()} Reconnection attempt failed:`, error);
+
+          // Stop immediately if rate limited - retrying will only make it worse
+          if (this.isRateLimitError(error)) {
+            /**
+             * Rate limiting sets shouldStopReconnecting to prevent hammering the server.
+             * Silent return here (vs throw in connectClient) because we're already in
+             * error recovery mode - throwing would just add noise. The connection
+             * must be recreated to retry after rate limit lifts.
+             */
+            logger.warn(
+              `${this.getLogPrefix()} Rate limited (429), stopping reconnection attempts`,
+            );
+            logger.debug(
+              `${this.getLogPrefix()} Rate limit block is permanent for this connection instance`,
+            );
+            this.shouldStopReconnecting = true;
+            return;
+          }
 
           if (
             this.reconnectAttempts === this.MAX_RECONNECT_ATTEMPTS ||
             (this.shouldStopReconnecting as boolean)
           ) {
-            this.logger?.error(`${this.getLogPrefix()} Stopping reconnection attempts`);
+            logger.error(`${this.getLogPrefix()} Stopping reconnection attempts`);
             return;
           }
         }
@@ -334,14 +599,8 @@ export class MCPConnection extends EventEmitter {
 
   private subscribeToResources(): void {
     this.client.setNotificationHandler(ResourceListChangedNotificationSchema, async () => {
-      this.invalidateCache();
       this.emit('resourcesChanged');
     });
-  }
-
-  private invalidateCache(): void {
-    // this.cachedConfig = null;
-    this.lastConfigUpdate = 0;
   }
 
   async connectClient(): Promise<void> {
@@ -366,28 +625,124 @@ export class MCPConnection extends EventEmitter {
             await this.client.close();
             this.transport = null;
           } catch (error) {
-            this.logger?.warn(`${this.getLogPrefix()} Error closing connection:`, error);
+            logger.warn(`${this.getLogPrefix()} Error closing connection:`, error);
           }
         }
 
         this.transport = this.constructTransport(this.options);
         this.setupTransportDebugHandlers();
 
-        const connectTimeout = this.options.initTimeout ?? 10000;
-        await Promise.race([
+        const connectTimeout = this.options.initTimeout ?? 120000;
+        await withTimeout(
           this.client.connect(this.transport),
-          new Promise((_resolve, reject) =>
-            setTimeout(() => reject(new Error('Connection timeout')), connectTimeout),
-          ),
-        ]);
+          connectTimeout,
+          `Connection timeout after ${connectTimeout}ms`,
+        );
 
         this.connectionState = 'connected';
         this.emit('connectionChange', 'connected');
         this.reconnectAttempts = 0;
       } catch (error) {
+        // Check if it's a rate limit error - stop immediately to avoid making it worse
+        if (this.isRateLimitError(error)) {
+          /**
+           * Rate limiting sets shouldStopReconnecting to prevent hammering the server.
+           * This is a permanent block for this connection instance - the connection
+           * must be recreated (e.g., by user re-initiating) to retry after rate limit lifts.
+           *
+           * We throw here (unlike handleReconnection which returns silently) because:
+           * - connectClient() is a public API - callers expect async errors to throw
+           * - Other errors in this catch block also throw for consistency
+           * - handleReconnection is private/internal error recovery, different context
+           */
+          logger.warn(`${this.getLogPrefix()} Rate limited (429), stopping connection attempts`);
+          this.shouldStopReconnecting = true;
+          this.connectionState = 'error';
+          this.emit('connectionChange', 'error');
+          throw error;
+        }
+
+        // Check if it's an OAuth authentication error
+        if (this.isOAuthError(error)) {
+          logger.warn(`${this.getLogPrefix()} OAuth authentication required`);
+          this.oauthRequired = true;
+          const serverUrl = this.url;
+          logger.debug(
+            `${this.getLogPrefix()} Server URL for OAuth: ${serverUrl ? sanitizeUrlForLogging(serverUrl) : 'undefined'}`,
+          );
+
+          const oauthTimeout = this.options.initTimeout ?? 60000 * 2;
+          /** Promise that will resolve when OAuth is handled */
+          const oauthHandledPromise = new Promise<void>((resolve, reject) => {
+            let timeoutId: NodeJS.Timeout | null = null;
+            let oauthHandledListener: (() => void) | null = null;
+            let oauthFailedListener: ((error: Error) => void) | null = null;
+
+            /** Cleanup function to remove listeners and clear timeout */
+            const cleanup = () => {
+              if (timeoutId) {
+                clearTimeout(timeoutId);
+              }
+              if (oauthHandledListener) {
+                this.off('oauthHandled', oauthHandledListener);
+              }
+              if (oauthFailedListener) {
+                this.off('oauthFailed', oauthFailedListener);
+              }
+            };
+
+            // Success handler
+            oauthHandledListener = () => {
+              cleanup();
+              resolve();
+            };
+
+            // Failure handler
+            oauthFailedListener = (error: Error) => {
+              cleanup();
+              reject(error);
+            };
+
+            // Timeout handler
+            timeoutId = setTimeout(() => {
+              cleanup();
+              reject(new Error(`OAuth handling timeout after ${oauthTimeout}ms`));
+            }, oauthTimeout);
+
+            // Listen for both success and failure events
+            this.once('oauthHandled', oauthHandledListener);
+            this.once('oauthFailed', oauthFailedListener);
+          });
+
+          // Emit the event
+          this.emit('oauthRequired', {
+            serverName: this.serverName,
+            error,
+            serverUrl,
+            userId: this.userId,
+          });
+
+          try {
+            // Wait for OAuth to be handled
+            await oauthHandledPromise;
+            // Reset the oauthRequired flag
+            this.oauthRequired = false;
+            // Don't throw the error - just return so connection can be retried
+            logger.info(
+              `${this.getLogPrefix()} OAuth handled successfully, connection will be retried`,
+            );
+            return;
+          } catch (oauthError) {
+            // OAuth failed or timed out
+            this.oauthRequired = false;
+            logger.error(`${this.getLogPrefix()} OAuth handling failed:`, oauthError);
+            // Re-throw the original authentication error
+            throw error;
+          }
+        }
+
         this.connectionState = 'error';
         this.emit('connectionChange', 'error');
-        this.lastError = error instanceof Error ? error : new Error(String(error));
         throw error;
       } finally {
         this.connectPromise = null;
@@ -403,7 +758,7 @@ export class MCPConnection extends EventEmitter {
     }
 
     this.transport.onmessage = (msg) => {
-      this.logger?.debug(`${this.getLogPrefix()} Transport received: ${JSON.stringify(msg)}`);
+      logger.debug(`${this.getLogPrefix()} Transport received: ${JSON.stringify(msg)}`);
     };
 
     const originalSend = this.transport.send.bind(this.transport);
@@ -414,7 +769,7 @@ export class MCPConnection extends EventEmitter {
         }
         this.lastPingTime = Date.now();
       }
-      this.logger?.debug(`${this.getLogPrefix()} Transport sending: ${JSON.stringify(msg)}`);
+      logger.debug(`${this.getLogPrefix()} Transport sending: ${JSON.stringify(msg)}`);
       return originalSend(msg);
     };
   }
@@ -423,18 +778,82 @@ export class MCPConnection extends EventEmitter {
     try {
       await this.disconnect();
       await this.connectClient();
-      if (!this.isConnected()) {
+      if (!(await this.isConnected())) {
         throw new Error('Connection not established');
       }
     } catch (error) {
-      this.logger?.error(`${this.getLogPrefix()} Connection failed:`, error);
+      logger.error(`${this.getLogPrefix()} Connection failed:`, error);
       throw error;
     }
   }
 
   private setupTransportErrorHandlers(transport: Transport): void {
     transport.onerror = (error) => {
-      this.logger?.error(`${this.getLogPrefix()} Transport error:`, error);
+      // Extract meaningful error information (handles "SSE error: undefined" cases)
+      const {
+        message: errorMessage,
+        code: errorCode,
+        isProxyHint,
+        isTransient,
+      } = extractSSEErrorMessage(error);
+
+      // Ignore SSE 404 errors for servers that don't support SSE
+      if (errorCode === 404 && errorMessage.toLowerCase().includes('failed to open sse stream')) {
+        logger.warn(`${this.getLogPrefix()} SSE stream not available (404). Ignoring.`);
+        return;
+      }
+
+      // Check if it's an OAuth authentication error
+      if (this.isOAuthError(error)) {
+        logger.warn(`${this.getLogPrefix()} OAuth authentication error detected`);
+        this.emit('oauthError', error);
+      }
+
+      /**
+       * Log with enhanced context for debugging.
+       * All transport.onerror events are logged as errors to preserve stack traces.
+       * isTransient indicates whether auto-reconnection is expected to succeed.
+       *
+       * The MCP SDK's SseError extends Error and includes:
+       * - code: HTTP status code or eventsource error code
+       * - event: The original eventsource ErrorEvent
+       * - stack: Full stack trace
+       */
+      const errorContext: Record<string, unknown> = {
+        code: errorCode,
+        isTransient,
+      };
+
+      if (isProxyHint) {
+        errorContext.hint = 'Check Nginx/proxy configuration for SSE endpoints';
+      }
+
+      // Extract additional debug info from SseError if available
+      if (error && typeof error === 'object') {
+        const sseError = error as { event?: unknown; stack?: string };
+
+        // Include the original eventsource event for debugging
+        if (sseError.event && typeof sseError.event === 'object') {
+          const event = sseError.event as { code?: number; message?: string; type?: string };
+          errorContext.eventDetails = {
+            type: event.type,
+            code: event.code,
+            message: event.message,
+          };
+        }
+
+        // Include stack trace if available
+        if (sseError.stack) {
+          errorContext.stack = sseError.stack;
+        }
+      }
+
+      const errorLabel = isTransient
+        ? 'Transport error (transient, will reconnect)'
+        : 'Transport error (may require manual intervention)';
+
+      logger.error(`${this.getLogPrefix()} ${errorLabel}: ${errorMessage}`, errorContext);
+
       this.emit('connectionChange', 'error');
     };
   }
@@ -450,11 +869,7 @@ export class MCPConnection extends EventEmitter {
       }
       this.connectionState = 'disconnected';
       this.emit('connectionChange', 'disconnected');
-    } catch (error) {
-      this.emit('error', error);
-      throw error;
     } finally {
-      this.invalidateCache();
       this.connectPromise = null;
     }
   }
@@ -464,7 +879,7 @@ export class MCPConnection extends EventEmitter {
       const { resources } = await this.client.listResources();
       return resources;
     } catch (error) {
-      this.emitError(error, 'Failed to fetch resources:');
+      this.emitError(error, 'Failed to fetch resources');
       return [];
     }
   }
@@ -474,7 +889,7 @@ export class MCPConnection extends EventEmitter {
       const { tools } = await this.client.listTools();
       return tools;
     } catch (error) {
-      this.emitError(error, 'Failed to fetch tools:');
+      this.emitError(error, 'Failed to fetch tools');
       return [];
     }
   }
@@ -484,100 +899,158 @@ export class MCPConnection extends EventEmitter {
       const { prompts } = await this.client.listPrompts();
       return prompts;
     } catch (error) {
-      this.emitError(error, 'Failed to fetch prompts:');
+      this.emitError(error, 'Failed to fetch prompts');
       return [];
     }
   }
 
-  // public async modifyConfig(config: ContinueConfig): Promise<ContinueConfig> {
-  //   try {
-  //     // Check cache
-  //     if (this.cachedConfig && Date.now() - this.lastConfigUpdate < this.CONFIG_TTL) {
-  //       return this.cachedConfig;
-  //     }
-
-  //     await this.connectClient();
-
-  //     // Fetch and process resources
-  //     const resources = await this.fetchResources();
-  //     const submenuItems = resources.map(resource => ({
-  //       title: resource.name,
-  //       description: resource.description,
-  //       id: resource.uri,
-  //     }));
-
-  //     if (!config.contextProviders) {
-  //       config.contextProviders = [];
-  //     }
-
-  //     config.contextProviders.push(
-  //       new MCPContextProvider({
-  //         submenuItems,
-  //         client: this.client,
-  //       }),
-  //     );
-
-  //     // Fetch and process tools
-  //     const tools = await this.fetchTools();
-  //     const continueTools: Tool[] = tools.map(tool => ({
-  //       displayTitle: tool.name,
-  //       function: {
-  //         description: tool.description,
-  //         name: tool.name,
-  //         parameters: tool.inputSchema,
-  //       },
-  //       readonly: false,
-  //       type: 'function',
-  //       wouldLikeTo: `use the ${tool.name} tool`,
-  //       uri: `mcp://${tool.name}`,
-  //     }));
-
-  //     config.tools = [...(config.tools || []), ...continueTools];
-
-  //     // Fetch and process prompts
-  //     const prompts = await this.fetchPrompts();
-  //     if (!config.slashCommands) {
-  //       config.slashCommands = [];
-  //     }
-
-  //     const slashCommands: SlashCommand[] = prompts.map(prompt =>
-  //       constructMcpSlashCommand(
-  //         this.client,
-  //         prompt.name,
-  //         prompt.description,
-  //         prompt.arguments?.map(a => a.name),
-  //       ),
-  //     );
-  //     config.slashCommands.push(...slashCommands);
-
-  //     // Update cache
-  //     this.cachedConfig = config;
-  //     this.lastConfigUpdate = Date.now();
-
-  //     return config;
-  //   } catch (error) {
-  //     this.emit('error', error);
-  //     // Return original config if modification fails
-  //     return config;
-  //   }
-  // }
-
-  // Public getters for state information
-  public getConnectionState(): t.ConnectionState {
-    return this.connectionState;
-  }
-
   public async isConnected(): Promise<boolean> {
+    // First check if we're in a connected state
+    if (this.connectionState !== 'connected') {
+      return false;
+    }
+
+    // If we recently checked, skip expensive verification
+    const now = Date.now();
+    if (now - this.lastConnectionCheckAt < mcpConfig.CONNECTION_CHECK_TTL) {
+      return true;
+    }
+    this.lastConnectionCheckAt = now;
+
     try {
+      // Try ping first as it's the lightest check
       await this.client.ping();
       return this.connectionState === 'connected';
     } catch (error) {
-      this.logger?.error(`${this.getLogPrefix()} Ping failed:`, error);
-      return false;
+      // Check if the error is because ping is not supported (method not found)
+      const pingUnsupported =
+        error instanceof Error &&
+        ((error as Error)?.message.includes('-32601') ||
+          (error as Error)?.message.includes('-32602') ||
+          (error as Error)?.message.includes('invalid method ping') ||
+          (error as Error)?.message.includes('Unsupported method: ping') ||
+          (error as Error)?.message.includes('method not found'));
+
+      if (!pingUnsupported) {
+        logger.error(`${this.getLogPrefix()} Ping failed:`, error);
+        return false;
+      }
+
+      // Ping is not supported by this server, try an alternative verification
+      logger.debug(
+        `${this.getLogPrefix()} Server does not support ping method, verifying connection with capabilities`,
+      );
+
+      try {
+        // Get server capabilities to verify connection is truly active
+        const capabilities = this.client.getServerCapabilities();
+
+        // If we have capabilities, try calling a supported method to verify connection
+        if (capabilities?.tools) {
+          await this.client.listTools();
+          return this.connectionState === 'connected';
+        } else if (capabilities?.resources) {
+          await this.client.listResources();
+          return this.connectionState === 'connected';
+        } else if (capabilities?.prompts) {
+          await this.client.listPrompts();
+          return this.connectionState === 'connected';
+        } else {
+          // No capabilities to test, but we're in connected state and initialization succeeded
+          logger.debug(
+            `${this.getLogPrefix()} No capabilities to test, assuming connected based on state`,
+          );
+          return this.connectionState === 'connected';
+        }
+      } catch (capabilityError) {
+        // If capability check fails, the connection is likely broken
+        logger.error(`${this.getLogPrefix()} Connection verification failed:`, capabilityError);
+        return false;
+      }
     }
   }
 
-  public getLastError(): Error | null {
-    return this.lastError;
+  public setOAuthTokens(tokens: MCPOAuthTokens): void {
+    this.oauthTokens = tokens;
+  }
+
+  /**
+   * Check if this connection is stale compared to config update time.
+   * A connection is stale if it was created before the config was updated.
+   *
+   * @param configUpdatedAt - Unix timestamp (ms) when config was last updated
+   * @returns true if connection was created before config update, false otherwise
+   */
+  public isStale(configUpdatedAt: number): boolean {
+    return this.createdAt < configUpdatedAt;
+  }
+
+  private isOAuthError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') {
+      return false;
+    }
+
+    // Check for error code
+    if ('code' in error) {
+      const code = (error as { code?: number }).code;
+      if (code === 401 || code === 403) {
+        return true;
+      }
+    }
+
+    // Check message for various auth error indicators
+    if ('message' in error && typeof error.message === 'string') {
+      const message = error.message.toLowerCase();
+      // Check for 401 status
+      if (message.includes('401') || message.includes('non-200 status code (401)')) {
+        return true;
+      }
+      // Check for invalid_token (OAuth servers return this for expired/revoked tokens)
+      if (message.includes('invalid_token')) {
+        return true;
+      }
+      // Check for invalid_grant (OAuth servers return this for expired/revoked grants)
+      if (message.includes('invalid_grant')) {
+        return true;
+      }
+      // Check for authentication required
+      if (message.includes('authentication required') || message.includes('unauthorized')) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Checks if an error indicates rate limiting (HTTP 429).
+   * Rate limited requests should stop reconnection attempts to avoid making the situation worse.
+   */
+  private isRateLimitError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') {
+      return false;
+    }
+
+    // Check for error code
+    if ('code' in error) {
+      const code = (error as { code?: number }).code;
+      if (code === 429) {
+        return true;
+      }
+    }
+
+    // Check message for rate limit indicators
+    if ('message' in error && typeof error.message === 'string') {
+      const message = error.message.toLowerCase();
+      if (
+        message.includes('429') ||
+        message.includes('rate limit') ||
+        message.includes('too many requests')
+      ) {
+        return true;
+      }
+    }
+
+    return false;
   }
 }

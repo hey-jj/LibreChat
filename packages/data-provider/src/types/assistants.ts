@@ -1,7 +1,7 @@
 import type { OpenAPIV3 } from 'openapi-types';
 import type { AssistantsEndpoint, AgentProvider } from 'src/schemas';
+import type { Agents, GraphEdge } from './agents';
 import type { ContentTypes } from './runs';
-import type { Agents } from './agents';
 import type { TFile } from './files';
 import { ArtifactModes } from 'src/artifacts';
 
@@ -23,6 +23,7 @@ export enum Tools {
   retrieval = 'retrieval',
   function = 'function',
   memory = 'memory',
+  ui_resources = 'ui_resources',
 }
 
 export enum EToolResources {
@@ -30,6 +31,7 @@ export enum EToolResources {
   execute_code = 'execute_code',
   file_search = 'file_search',
   image_edit = 'image_edit',
+  context = 'context',
   ocr = 'ocr',
 }
 
@@ -164,6 +166,7 @@ export type AgentModelParameters = {
   top_p: AgentParameterValue;
   frequency_penalty: AgentParameterValue;
   presence_penalty: AgentParameterValue;
+  useResponsesApi?: boolean;
 };
 
 export interface AgentBaseResource {
@@ -181,6 +184,8 @@ export interface AgentToolResources {
   [EToolResources.image_edit]?: AgentBaseResource;
   [EToolResources.execute_code]?: ExecuteCodeResource;
   [EToolResources.file_search]?: AgentFileResource;
+  [EToolResources.context]?: AgentBaseResource;
+  /** @deprecated Use context instead */
   [EToolResources.ocr]?: AgentBaseResource;
 }
 /**
@@ -196,8 +201,13 @@ export interface AgentFileResource extends AgentBaseResource {
    */
   vector_store_ids?: Array<string>;
 }
+export type SupportContact = {
+  name?: string;
+  email?: string;
+};
 
 export type Agent = {
+  _id?: string;
   id: string;
   name: string | null;
   author?: string | null;
@@ -217,14 +227,20 @@ export type Agent = {
   model: string | null;
   model_parameters: AgentModelParameters;
   conversation_starters?: string[];
+  /** @deprecated Use ACL permissions instead */
   isCollaborative?: boolean;
   tool_resources?: AgentToolResources;
+  /** @deprecated Use edges instead */
   agent_ids?: string[];
+  edges?: GraphEdge[];
   end_after_tools?: boolean;
   hide_sequential_outputs?: boolean;
   artifacts?: ArtifactModes;
   recursion_limit?: number;
+  isPublic?: boolean;
   version?: number;
+  category?: string;
+  support_contact?: SupportContact;
 };
 
 export type TAgentsMap = Record<string, Agent | undefined>;
@@ -241,7 +257,14 @@ export type AgentCreateParams = {
   model_parameters: AgentModelParameters;
 } & Pick<
   Agent,
-  'agent_ids' | 'end_after_tools' | 'hide_sequential_outputs' | 'artifacts' | 'recursion_limit'
+  | 'agent_ids'
+  | 'edges'
+  | 'end_after_tools'
+  | 'hide_sequential_outputs'
+  | 'artifacts'
+  | 'recursion_limit'
+  | 'category'
+  | 'support_contact'
 >;
 
 export type AgentUpdateParams = {
@@ -260,15 +283,23 @@ export type AgentUpdateParams = {
   isCollaborative?: boolean;
 } & Pick<
   Agent,
-  'agent_ids' | 'end_after_tools' | 'hide_sequential_outputs' | 'artifacts' | 'recursion_limit'
+  | 'agent_ids'
+  | 'edges'
+  | 'end_after_tools'
+  | 'hide_sequential_outputs'
+  | 'artifacts'
+  | 'recursion_limit'
+  | 'category'
+  | 'support_contact'
 >;
 
 export type AgentListParams = {
   limit?: number;
-  before?: string | null;
-  after?: string | null;
-  order?: 'asc' | 'desc';
-  provider?: AgentProvider;
+  requiredPermission: number;
+  category?: string;
+  search?: string;
+  cursor?: string;
+  promoted?: 0 | 1;
 };
 
 export type AgentListResponse = {
@@ -277,6 +308,7 @@ export type AgentListResponse = {
   first_id: string;
   last_id: string;
   has_more: boolean;
+  after?: string;
 };
 
 export type AgentFile = {
@@ -435,7 +467,16 @@ export type PartMetadata = {
   action?: boolean;
   auth?: string;
   expires_at?: number;
+  /** Index indicating parallel sibling content (same stepIndex in multi-agent runs) */
+  siblingIndex?: number;
+  /** Agent ID for parallel agent rendering - identifies which agent produced this content */
+  agentId?: string;
+  /** Group ID for parallel content - parts with same groupId are displayed in columns */
+  groupId?: number;
 };
+
+/** Metadata for parallel content rendering - subset of PartMetadata */
+export type ContentMetadata = Pick<PartMetadata, 'agentId' | 'groupId'>;
 
 export type ContentPart = (
   | CodeToolCall
@@ -448,11 +489,21 @@ export type ContentPart = (
 ) &
   PartMetadata;
 
+export type TextData = (Text & PartMetadata) | undefined;
+
 export type TMessageContentParts =
-  | { type: ContentTypes.ERROR; text?: string | (Text & PartMetadata); error?: string }
-  | { type: ContentTypes.THINK; think: string | (Text & PartMetadata) }
-  | { type: ContentTypes.TEXT; text: string | (Text & PartMetadata); tool_call_ids?: string[] }
-  | {
+  | ({
+      type: ContentTypes.ERROR;
+      text?: string | TextData;
+      error?: string;
+    } & ContentMetadata)
+  | ({ type: ContentTypes.THINK; think?: string | TextData } & ContentMetadata)
+  | ({
+      type: ContentTypes.TEXT;
+      text?: string | TextData;
+      tool_call_ids?: string[];
+    } & ContentMetadata)
+  | ({
       type: ContentTypes.TOOL_CALL;
       tool_call: (
         | CodeToolCall
@@ -462,10 +513,12 @@ export type TMessageContentParts =
         | Agents.AgentToolCall
       ) &
         PartMetadata;
-    }
-  | { type: ContentTypes.IMAGE_FILE; image_file: ImageFile & PartMetadata }
-  | Agents.AgentUpdate
-  | Agents.MessageContentImageUrl;
+    } & ContentMetadata)
+  | ({ type: ContentTypes.IMAGE_FILE; image_file: ImageFile & PartMetadata } & ContentMetadata)
+  | (Agents.AgentUpdate & ContentMetadata)
+  | (Agents.MessageContentImageUrl & ContentMetadata)
+  | (Agents.MessageContentVideoUrl & ContentMetadata)
+  | (Agents.MessageContentInputAudio & ContentMetadata);
 
 export type StreamContentData = TMessageContentParts & {
   /** The index of the current content part */
@@ -486,77 +539,6 @@ export const actionDelimiter = '_action_';
 export const actionDomainSeparator = '---';
 export const hostImageIdSuffix = '_host_copy';
 export const hostImageNamePrefix = 'host_copy_';
-
-export enum AuthTypeEnum {
-  ServiceHttp = 'service_http',
-  OAuth = 'oauth',
-  None = 'none',
-}
-
-export enum AuthorizationTypeEnum {
-  Bearer = 'bearer',
-  Basic = 'basic',
-  Custom = 'custom',
-}
-
-export enum TokenExchangeMethodEnum {
-  DefaultPost = 'default_post',
-  BasicAuthHeader = 'basic_auth_header',
-}
-
-export type ActionAuth = {
-  authorization_type?: AuthorizationTypeEnum;
-  custom_auth_header?: string;
-  type?: AuthTypeEnum;
-  authorization_content_type?: string;
-  authorization_url?: string;
-  client_url?: string;
-  scope?: string;
-  token_exchange_method?: TokenExchangeMethodEnum;
-};
-
-export type MCPAuth = ActionAuth;
-
-export type ActionMetadata = {
-  api_key?: string;
-  auth?: ActionAuth;
-  domain?: string;
-  privacy_policy_url?: string;
-  raw_spec?: string;
-  oauth_client_id?: string;
-  oauth_client_secret?: string;
-};
-
-export type MCPMetadata = Omit<ActionMetadata, 'auth'> & {
-  name?: string;
-  description?: string;
-  url?: string;
-  tools?: string[];
-  auth?: MCPAuth;
-  icon?: string;
-  trust?: boolean;
-};
-
-export type ActionMetadataRuntime = ActionMetadata & {
-  oauth_access_token?: string;
-  oauth_refresh_token?: string;
-  oauth_token_expires_at?: Date;
-};
-
-/* Assistant types */
-
-export type Action = {
-  action_id: string;
-  type?: string;
-  settings?: Record<string, unknown>;
-  metadata: ActionMetadata;
-  version: number | string;
-} & ({ assistant_id: string; agent_id?: never } | { assistant_id?: never; agent_id: string });
-
-export type MCP = {
-  mcp_id: string;
-  metadata: MCPMetadata;
-} & ({ assistant_id: string; agent_id?: never } | { assistant_id?: never; agent_id: string });
 
 export type AssistantAvatar = {
   filepath: string;

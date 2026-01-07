@@ -1,4 +1,4 @@
-const availableTools = require('./manifest.json');
+const manifest = require('./manifest');
 
 // Structured Tools
 const DALLE3 = require('./structured/DALLE3');
@@ -12,24 +12,10 @@ const GoogleSearchAPI = require('./structured/GoogleSearch');
 const TraversaalSearch = require('./structured/TraversaalSearch');
 const createOpenAIImageTools = require('./structured/OpenAIImageTools');
 const TavilySearchResults = require('./structured/TavilySearchResults');
-
-/** @type {Record<string, TPlugin | undefined>} */
-const manifestToolMap = {};
-
-/** @type {Array<TPlugin>} */
-const toolkits = [];
-
-availableTools.forEach((tool) => {
-  manifestToolMap[tool.pluginKey] = tool;
-  if (tool.toolkit === true) {
-    toolkits.push(tool);
-  }
-});
+const createGeminiImageTool = require('./structured/GeminiImageGen');
 
 module.exports = {
-  toolkits,
-  availableTools,
-  manifestToolMap,
+  ...manifest,
   // Structured Tools
   DALLE3,
   FluxAPI,
@@ -42,4 +28,5 @@ module.exports = {
   createYouTubeTools,
   TavilySearchResults,
   createOpenAIImageTools,
+  createGeminiImageTool,
 };

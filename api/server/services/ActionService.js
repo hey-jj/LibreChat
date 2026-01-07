@@ -1,9 +1,14 @@
 const jwt = require('jsonwebtoken');
 const { nanoid } = require('nanoid');
 const { tool } = require('@langchain/core/tools');
-const { logger } = require('@librechat/data-schemas');
 const { GraphEvents, sleep } = require('@librechat/agents');
-const { sendEvent, logAxiosError } = require('@librechat/api');
+const { logger, encryptV2, decryptV2 } = require('@librechat/data-schemas');
+const {
+  sendEvent,
+  logAxiosError,
+  refreshAccessToken,
+  GenerationJobManager,
+} = require('@librechat/api');
 const {
   Time,
   CacheKeys,
@@ -14,13 +19,11 @@ const {
   isImageVisionTool,
   actionDomainSeparator,
 } = require('librechat-data-provider');
-const { refreshAccessToken } = require('~/server/services/TokenService');
-const { encryptV2, decryptV2 } = require('~/server/utils/crypto');
+const { findToken, updateToken, createToken } = require('~/models');
 const { getActions, deleteActions } = require('~/models/Action');
 const { deleteAssistant } = require('~/models/Assistant');
 const { getFlowStateManager } = require('~/config');
 const { getLogStores } = require('~/cache');
-const { findToken } = require('~/models');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const toolNameRegex = /^[a-zA-Z0-9_-]+$/;
@@ -129,6 +132,7 @@ async function loadActionSets(searchParams) {
  * @param {string | undefined} [params.description] - The description for the tool.
  * @param {import('zod').ZodTypeAny | undefined} [params.zodSchema] - The Zod schema for tool input validation/definition
  * @param {{ oauth_client_id?: string; oauth_client_secret?: string; }} params.encrypted - The encrypted values for the action.
+ * @param {string | null} [params.streamId] - The stream ID for resumable streams.
  * @returns { Promise<typeof tool | { _call: (toolInput: Object | string) => unknown}> } An object with `_call` method to execute the tool input.
  */
 async function createActionTool({
@@ -140,6 +144,7 @@ async function createActionTool({
   name,
   description,
   encrypted,
+  streamId = null,
 }) {
   /** @type {(toolInput: Object | string, config: GraphRunnableConfig) => Promise<unknown>} */
   const _call = async (toolInput, config) => {
@@ -194,7 +199,12 @@ async function createActionTool({
                   `${identifier}:oauth_login:${config.metadata.thread_id}:${config.metadata.run_id}`,
                   'oauth_login',
                   async () => {
-                    sendEvent(res, { event: GraphEvents.ON_RUN_STEP_DELTA, data });
+                    const eventData = { event: GraphEvents.ON_RUN_STEP_DELTA, data };
+                    if (streamId) {
+                      GenerationJobManager.emitChunk(streamId, eventData);
+                    } else {
+                      sendEvent(res, eventData);
+                    }
                     logger.debug('Sent OAuth login request to client', { action_id, identifier });
                     return true;
                   },
@@ -219,7 +229,12 @@ async function createActionTool({
                 logger.debug('Received OAuth Authorization response', { action_id, identifier });
                 data.delta.auth = undefined;
                 data.delta.expires_at = undefined;
-                sendEvent(res, { event: GraphEvents.ON_RUN_STEP_DELTA, data });
+                const successEventData = { event: GraphEvents.ON_RUN_STEP_DELTA, data };
+                if (streamId) {
+                  GenerationJobManager.emitChunk(streamId, successEventData);
+                } else {
+                  sendEvent(res, successEventData);
+                }
                 await sleep(3000);
                 metadata.oauth_access_token = result.access_token;
                 metadata.oauth_refresh_token = result.refresh_token;
@@ -258,15 +273,22 @@ async function createActionTool({
               try {
                 const refresh_token = await decryptV2(refreshTokenData.token);
                 const refreshTokens = async () =>
-                  await refreshAccessToken({
-                    userId,
-                    identifier,
-                    refresh_token,
-                    client_url: metadata.auth.client_url,
-                    encrypted_oauth_client_id: encrypted.oauth_client_id,
-                    token_exchange_method: metadata.auth.token_exchange_method,
-                    encrypted_oauth_client_secret: encrypted.oauth_client_secret,
-                  });
+                  await refreshAccessToken(
+                    {
+                      userId,
+                      identifier,
+                      refresh_token,
+                      client_url: metadata.auth.client_url,
+                      encrypted_oauth_client_id: encrypted.oauth_client_id,
+                      token_exchange_method: metadata.auth.token_exchange_method,
+                      encrypted_oauth_client_secret: encrypted.oauth_client_secret,
+                    },
+                    {
+                      findToken,
+                      updateToken,
+                      createToken,
+                    },
+                  );
                 const flowsCache = getLogStores(CacheKeys.FLOWS);
                 const flowManager = getFlowStateManager(flowsCache);
                 const refreshData = await flowManager.createFlowWithHandler(

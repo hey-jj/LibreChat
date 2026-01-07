@@ -1,5 +1,6 @@
 import { memo, useRef, useMemo, useEffect, useState, useCallback } from 'react';
 import { useWatch } from 'react-hook-form';
+import { TextareaAutosize } from '@librechat/client';
 import { useRecoilState, useRecoilValue } from 'recoil';
 import { Constants, isAssistantsEndpoint, isAgentsEndpoint } from 'librechat-data-provider';
 import {
@@ -11,6 +12,7 @@ import {
 import {
   useTextarea,
   useAutoSave,
+  useLocalize,
   useRequiresKey,
   useHandleKeyUp,
   useQueryParams,
@@ -20,7 +22,6 @@ import {
 import { mainTextareaId, BadgeItem } from '~/common';
 import AttachFileChat from './Files/AttachFileChat';
 import FileFormChat from './Files/FileFormChat';
-import { TextareaAutosize } from '~/components';
 import { cn, removeFocusRings } from '~/utils';
 import TextareaHeader from './TextareaHeader';
 import PromptsCommand from './PromptsCommand';
@@ -38,6 +39,7 @@ const ChatForm = memo(({ index = 0 }: { index?: number }) => {
   const submitButtonRef = useRef<HTMLButtonElement>(null);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
   useFocusChatEffect(textAreaRef);
+  const localize = useLocalize();
 
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [, setIsScrollable] = useState(false);
@@ -73,14 +75,11 @@ const ChatForm = memo(({ index = 0 }: { index?: number }) => {
     handleStopGenerating,
   } = useChatContext();
   const {
-    addedIndex,
     generateConversation,
     conversation: addedConvo,
     setConversation: setAddedConvo,
-    isSubmitting: isSubmittingAdded,
   } = useAddedChatContext();
   const assistantMap = useAssistantsMapContext();
-  const showStopAdded = useRecoilValue(store.showStopButtonByIndex(addedIndex));
 
   const endpoint = useMemo(
     () => conversation?.endpointType ?? conversation?.endpoint,
@@ -126,7 +125,7 @@ const ChatForm = memo(({ index = 0 }: { index?: number }) => {
     setFiles,
     textAreaRef,
     conversationId,
-    isSubmitting: isSubmitting || isSubmittingAdded,
+    isSubmitting,
   });
 
   const { submitMessage, submitPrompt } = useSubmitMessage();
@@ -220,6 +219,7 @@ const ChatForm = memo(({ index = 0 }: { index?: number }) => {
         <div className={cn('flex w-full items-center', isRTL && 'flex-row-reverse')}>
           {showPlusPopover && !isAssistantsEndpoint(endpoint) && (
             <Mention
+              conversation={conversation}
               setShowMentionPopover={setShowPlusPopover}
               newConversation={generateConversation}
               textAreaRef={textAreaRef}
@@ -230,6 +230,7 @@ const ChatForm = memo(({ index = 0 }: { index?: number }) => {
           )}
           {showMentionPopover && (
             <Mention
+              conversation={conversation}
               setShowMentionPopover={setShowMentionPopover}
               newConversation={newConversation}
               textAreaRef={textAreaRef}
@@ -247,45 +248,60 @@ const ChatForm = memo(({ index = 0 }: { index?: number }) => {
             )}
           >
             <TextareaHeader addedConvo={addedConvo} setAddedConvo={setAddedConvo} />
+            {/* WIP */}
             <EditBadges
               isEditingChatBadges={isEditingBadges}
               handleCancelBadges={handleCancelBadges}
               handleSaveBadges={handleSaveBadges}
               setBadges={setBadges}
             />
-            <FileFormChat disableInputs={disableInputs} />
+            <FileFormChat conversation={conversation} />
             {endpoint && (
               <div className={cn('flex', isRTL ? 'flex-row-reverse' : 'flex-row')}>
-                <TextareaAutosize
-                  {...registerProps}
-                  ref={(e) => {
-                    ref(e);
-                    (textAreaRef as React.MutableRefObject<HTMLTextAreaElement | null>).current = e;
-                  }}
-                  disabled={disableInputs || isNotAppendable}
-                  onPaste={handlePaste}
-                  onKeyDown={handleKeyDown}
-                  onKeyUp={handleKeyUp}
-                  onCompositionStart={handleCompositionStart}
-                  onCompositionEnd={handleCompositionEnd}
-                  id={mainTextareaId}
-                  tabIndex={0}
-                  data-testid="text-input"
-                  rows={1}
-                  onFocus={() => {
-                    handleFocusOrClick();
-                    setIsTextAreaFocused(true);
-                  }}
-                  onBlur={setIsTextAreaFocused.bind(null, false)}
-                  onClick={handleFocusOrClick}
-                  style={{ height: 44, overflowY: 'auto' }}
-                  className={cn(
-                    baseClasses,
-                    removeFocusRings,
-                    'transition-[max-height] duration-200 disabled:cursor-not-allowed',
+                <div className="relative flex-1">
+                  <TextareaAutosize
+                    {...registerProps}
+                    ref={(e) => {
+                      ref(e);
+                      (textAreaRef as React.MutableRefObject<HTMLTextAreaElement | null>).current =
+                        e;
+                    }}
+                    disabled={disableInputs || isNotAppendable}
+                    onPaste={handlePaste}
+                    onKeyDown={handleKeyDown}
+                    onKeyUp={handleKeyUp}
+                    onCompositionStart={handleCompositionStart}
+                    onCompositionEnd={handleCompositionEnd}
+                    id={mainTextareaId}
+                    tabIndex={0}
+                    data-testid="text-input"
+                    rows={1}
+                    onFocus={() => {
+                      handleFocusOrClick();
+                      setIsTextAreaFocused(true);
+                    }}
+                    onBlur={setIsTextAreaFocused.bind(null, false)}
+                    aria-label={localize('com_ui_message_input')}
+                    onClick={handleFocusOrClick}
+                    style={{ height: 44, overflowY: 'auto' }}
+                    className={cn(
+                      baseClasses,
+                      removeFocusRings,
+                      'scrollbar-hover transition-[max-height] duration-200 disabled:cursor-not-allowed',
+                    )}
+                  />
+                  {isCollapsed && (
+                    <div
+                      className="pointer-events-none absolute bottom-0 left-0 right-0 h-10 transition-all duration-200"
+                      style={{
+                        backdropFilter: 'blur(2px)',
+                        WebkitMaskImage: 'linear-gradient(to top, black 15%, transparent 75%)',
+                        maskImage: 'linear-gradient(to top, black 15%, transparent 75%)',
+                      }}
+                    />
                   )}
-                />
-                <div className="flex flex-col items-start justify-start pt-1.5">
+                </div>
+                <div className="flex flex-col items-start justify-start pr-2.5 pt-1.5">
                   <CollapseChat
                     isCollapsed={isCollapsed}
                     isScrollable={isMoreThanThreeRows}
@@ -296,15 +312,18 @@ const ChatForm = memo(({ index = 0 }: { index?: number }) => {
             )}
             <div
               className={cn(
-                'items-between flex gap-2 pb-2',
+                '@container items-between flex gap-2 pb-2',
                 isRTL ? 'flex-row-reverse' : 'flex-row',
               )}
             >
               <div className={`${isRTL ? 'mr-2' : 'ml-2'}`}>
-                <AttachFileChat disableInputs={disableInputs} />
+                <AttachFileChat conversation={conversation} disableInputs={disableInputs} />
               </div>
               <BadgeRow
-                showEphemeralBadges={!isAgentsEndpoint(endpoint) && !isAssistantsEndpoint(endpoint)}
+                showEphemeralBadges={
+                  !!endpoint && !isAgentsEndpoint(endpoint) && !isAssistantsEndpoint(endpoint)
+                }
+                isSubmitting={isSubmitting}
                 conversationId={conversationId}
                 onChange={setBadges}
                 isInChat={
@@ -322,7 +341,7 @@ const ChatForm = memo(({ index = 0 }: { index?: number }) => {
                 />
               )}
               <div className={`${isRTL ? 'ml-2' : 'mr-2'}`}>
-                {(isSubmitting || isSubmittingAdded) && (showStopButton || showStopAdded) ? (
+                {isSubmitting && showStopButton ? (
                   <StopButton stop={handleStopGenerating} setShowStopButton={setShowStopButton} />
                 ) : (
                   endpoint && (
