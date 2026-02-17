@@ -8,26 +8,8 @@ import type {
   TFile,
 } from 'librechat-data-provider';
 import { handleMemoryArtifact } from '~/utils/memory';
+import { normalizeAttachmentData } from '~/utils/attachments';
 import store from '~/store';
-
-type LegacyAttachmentShape = {
-  message_id?: string;
-  conversation_id?: string;
-  tool_call_id?: string;
-  url?: string;
-};
-
-export function normalizeAttachmentData(data: TAttachment): TAttachment {
-  const legacy = data as TAttachment & LegacyAttachmentShape;
-
-  return {
-    ...legacy,
-    messageId: legacy.messageId ?? legacy.message_id,
-    conversationId: legacy.conversationId ?? legacy.conversation_id,
-    toolCallId: legacy.toolCallId ?? legacy.tool_call_id,
-    filepath: (legacy as TFile).filepath ?? legacy.url,
-  };
-}
 
 export default function useAttachmentHandler(queryClient?: QueryClient) {
   const setAttachmentsMap = useSetRecoilState(store.messageAttachmentsMap);

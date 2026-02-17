@@ -1,5 +1,5 @@
 import type { TAttachment } from 'librechat-data-provider';
-import { normalizeAttachmentData } from '~/hooks/SSE/useAttachmentHandler';
+import { normalizeAttachmentData } from '~/utils/attachments';
 
 describe('normalizeAttachmentData', () => {
   it('normalizes snake_case fields from responses attachment events', () => {
@@ -45,4 +45,3 @@ describe('normalizeAttachmentData', () => {
     expect((normalized as { filepath?: string }).filepath).toBe('https://example.com/camel.png');
   });
 });
-

@@ -82,8 +82,10 @@ export default function OpenAIImageGen({
     height = undefined;
   }
 
-  // Default to 1024x1024 if width and height are still undefined after parsing args and attachment metadata
-  const attachment = attachments?.[0];
+  const attachment = attachments?.find((item) => {
+    const file = item as TFile & TAttachmentMetadata;
+    return typeof file.filepath === 'string' && file.filepath.length > 0;
+  });
   const {
     width: imageWidth,
     height: imageHeight,
@@ -92,6 +94,7 @@ export default function OpenAIImageGen({
   } = (attachment as TFile & TAttachmentMetadata) || {};
   const hasImagePath = typeof filepath === 'string' && filepath.length > 0;
 
+  // Default to 1024x1024 if width and height are still undefined after parsing args and attachment metadata
   let origWidth = width ?? imageWidth;
   let origHeight = height ?? imageHeight;
 
