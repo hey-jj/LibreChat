@@ -5,6 +5,29 @@ import Image from '~/components/Chat/Messages/Content/Image';
 import ProgressText from './ProgressText';
 import { scaleImage } from '~/utils';
 
+function parseToolArgs(args: string | Record<string, unknown>): Record<string, unknown> {
+  if (typeof args !== 'string') {
+    return args;
+  }
+
+  const trimmed = args.trim();
+  if (!trimmed) {
+    return {};
+  }
+
+  // During streamed tool calls, args can be temporarily partial JSON.
+  // Ignore parse attempts until it looks complete.
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(trimmed) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
 export default function OpenAIImageGen({
   initialProgress = 0.1,
   isSubmitting,
@@ -32,14 +55,7 @@ export default function OpenAIImageGen({
   let height: number | undefined;
   let quality: 'low' | 'medium' | 'high' = 'high';
 
-  // Parse args if it's a string
-  let parsedArgs;
-  try {
-    parsedArgs = typeof _args === 'string' ? JSON.parse(_args) : _args;
-  } catch (error) {
-    console.error('Error parsing args:', error);
-    parsedArgs = {};
-  }
+  const parsedArgs = parseToolArgs(_args);
 
   try {
     const argsObj = parsedArgs;
@@ -74,6 +90,7 @@ export default function OpenAIImageGen({
     filepath = null,
     filename = '',
   } = (attachment as TFile & TAttachmentMetadata) || {};
+  const hasImagePath = typeof filepath === 'string' && filepath.length > 0;
 
   let origWidth = width ?? imageWidth;
   let origHeight = height ?? imageHeight;
@@ -188,14 +205,16 @@ export default function OpenAIImageGen({
               height={dimensions.height}
             />
           )}
-          <Image
-            altText={filename}
-            imagePath={filepath ?? ''}
-            width={Number(dimensions.width?.split('px')[0])}
-            height={Number(dimensions.height?.split('px')[0])}
-            placeholderDimensions={{ width: dimensions.width, height: dimensions.height }}
-            args={parsedArgs}
-          />
+          {hasImagePath && (
+            <Image
+              altText={filename}
+              imagePath={filepath ?? ''}
+              width={Number(dimensions.width?.split('px')[0])}
+              height={Number(dimensions.height?.split('px')[0])}
+              placeholderDimensions={{ width: dimensions.width, height: dimensions.height }}
+              args={parsedArgs}
+            />
+          )}
         </div>
       </div>
     </>
