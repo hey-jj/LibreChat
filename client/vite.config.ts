@@ -231,7 +231,7 @@ export default defineConfig(({ command }) => ({
               normalizedId.includes('node_modules/highlight.js') ||
               normalizedId.includes('node_modules/lowlight')
             ) {
-              return 'markdown_highlight';
+              return 'vendor';
             }
             if (normalizedId.includes('katex') || normalizedId.includes('node_modules/katex')) {
               return 'math-katex';
