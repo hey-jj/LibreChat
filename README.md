@@ -160,6 +160,7 @@ Open source, actively developed, and built for anyone who values control over th
   - **Website:** [librechat.ai](https://librechat.ai)
   - **Documentation:** [librechat.ai/docs](https://librechat.ai/docs)
   - **Blog:** [librechat.ai/blog](https://librechat.ai/blog)
+  - **Internal Production Deployment:** [DEPLOYMENT.md](DEPLOYMENT.md)
 
 ---
 
