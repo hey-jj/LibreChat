@@ -151,6 +151,7 @@ hive-mind-prompt-*.txt
 .claude/settings.local.json
 .mcp.json
 claude-flow.config.json
+.firebase/
 .swarm/
 .hive-mind/
 .claude-flow/
