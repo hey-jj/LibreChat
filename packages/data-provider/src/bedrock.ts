@@ -6,7 +6,38 @@ const DEFAULT_THINKING_BUDGET = 2000;
 
 const bedrockReasoningConfigValues = new Set<string>(Object.values(s.BedrockReasoningConfig));
 
-type ThinkingConfig = { type: 'enabled'; budget_tokens: number } | { type: 'adaptive' };
+type ThinkingDisplayValue = 'summarized' | 'omitted';
+
+type ThinkingConfig =
+  | { type: 'enabled'; budget_tokens: number }
+  | { type: 'adaptive'; display?: ThinkingDisplayValue };
+
+/**
+ * Resolves the final `thinking.display` value for an adaptive-thinking request.
+ *
+ * Starting with Claude Opus 4.7, the Messages API returns empty `thinking`
+ * blocks unless the request sets `thinking.display`. This helper encodes the
+ * three user-facing modes — `'auto'` (LibreChat decides), `'summarized'`, and
+ * `'omitted'` — into the wire value (or `undefined` when the field should be
+ * left off).
+ *
+ * See https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7#thinking-content-omitted-by-default
+ */
+export function resolveThinkingDisplay(
+  model: string,
+  explicit?: s.ThinkingDisplay | string | null,
+): ThinkingDisplayValue | undefined {
+  if (explicit === s.ThinkingDisplay.summarized) {
+    return 'summarized';
+  }
+  if (explicit === s.ThinkingDisplay.omitted) {
+    return 'omitted';
+  }
+  if (omitsThinkingByDefault(model)) {
+    return 'summarized';
+  }
+  return undefined;
+}
 
 type AnthropicReasoning = {
   thinking?: ThinkingConfig | boolean;
@@ -65,6 +96,24 @@ export function supportsAdaptiveThinking(model: string): boolean {
   }
   const sonnet = parseSonnetVersion(model);
   if (sonnet != null && (sonnet.major > 4 || (sonnet.major === 4 && sonnet.minor >= 6))) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Checks if a model omits `thinking` content from responses by default.
+ *
+ * Starting with Claude Opus 4.7, the Messages API returns empty `thinking`
+ * blocks unless the request explicitly opts in via `thinking.display =
+ * "summarized"`. This helper narrows the opt-in to Opus 4.7+ (and any future
+ * major Opus version) so older adaptive-thinking models are left untouched.
+ *
+ * See https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7#thinking-content-omitted-by-default
+ */
+export function omitsThinkingByDefault(model: string): boolean {
+  const opus = parseOpusVersion(model);
+  if (opus && (opus.major > 4 || (opus.major === 4 && opus.minor >= 7))) {
     return true;
   }
   return false;
@@ -136,6 +185,7 @@ export const bedrockInputSchema = s.tConversationSchema
     thinking: true,
     thinkingBudget: true,
     effort: true,
+    thinkingDisplay: true,
     reasoning_effort: true,
     promptCache: true,
     /* Catch-all fields */
@@ -181,6 +231,7 @@ export const bedrockInputParser = s.tConversationSchema
     thinking: true,
     thinkingBudget: true,
     effort: true,
+    thinkingDisplay: true,
     reasoning_effort: true,
     promptCache: true,
     /* Catch-all fields */
@@ -243,8 +294,17 @@ export const bedrockInputParser = s.tConversationSchema
           delete additionalFields.thinking;
           delete additionalFields.thinkingBudget;
         } else {
-          additionalFields.thinking = { type: 'adaptive' };
+          const thinkingConfig: ThinkingConfig = { type: 'adaptive' };
+          const display = resolveThinkingDisplay(
+            typedData.model as string,
+            additionalFields.thinkingDisplay as s.ThinkingDisplay | string | null | undefined,
+          );
+          if (display) {
+            thinkingConfig.display = display;
+          }
+          additionalFields.thinking = thinkingConfig;
           delete additionalFields.thinkingBudget;
+          delete additionalFields.thinkingDisplay;
         }
       } else {
         if (additionalFields.thinking === undefined) {
@@ -258,6 +318,7 @@ export const bedrockInputParser = s.tConversationSchema
           additionalFields.thinkingBudget = DEFAULT_THINKING_BUDGET;
         }
         delete additionalFields.effort;
+        delete additionalFields.thinkingDisplay;
       }
 
       /** Anthropic uses 'effort' via output_config, not reasoning_config */
@@ -273,6 +334,7 @@ export const bedrockInputParser = s.tConversationSchema
       delete additionalFields.thinking;
       delete additionalFields.thinkingBudget;
       delete additionalFields.effort;
+      delete additionalFields.thinkingDisplay;
       delete additionalFields.output_config;
       delete additionalFields.anthropic_beta;
 
