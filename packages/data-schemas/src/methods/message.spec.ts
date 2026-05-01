@@ -123,6 +123,17 @@ describe('Message Operations', () => {
   });
 
   describe('updateMessage', () => {
+    const feedbackPayload: NonNullable<IMessage['feedback']> = {
+      rating: 'thumbsDown',
+      tag: {
+        key: 'other',
+        label: 'com_ui_feedback_tag_other',
+        direction: 'thumbsDown',
+        icon: 'HelpCircle',
+      },
+      text: 'Needs improvement',
+    };
+
     it('should update a message for the authenticated user', async () => {
       // First save a message
       await saveMessage(mockCtx, mockMessageData);
@@ -138,6 +149,113 @@ describe('Message Operations', () => {
       // Verify in database
       const updatedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' });
       expect(updatedMessage?.text).toBe('Updated text');
+    });
+
+    it('should reject same-user text updates when conversationId does not match', async () => {
+      const messageId = uuidv4();
+      const conversationId = uuidv4();
+
+      await saveMessage(mockCtx, {
+        messageId,
+        conversationId,
+        text: 'Original text',
+      });
+
+      await expect(
+        updateMessage(mockCtx.userId, {
+          messageId,
+          conversationId: uuidv4(),
+          text: 'Updated text',
+        }),
+      ).rejects.toThrow('Message not found or user not authorized.');
+
+      const unchangedMessage = await Message.findOne({ messageId, user: mockCtx.userId });
+      expect(unchangedMessage?.conversationId).toBe(conversationId);
+      expect(unchangedMessage?.text).toBe('Original text');
+    });
+
+    it('should update text when conversationId matches', async () => {
+      const messageId = uuidv4();
+      const conversationId = uuidv4();
+
+      await saveMessage(mockCtx, {
+        messageId,
+        conversationId,
+        text: 'Original text',
+      });
+
+      const result = await updateMessage(mockCtx.userId, {
+        messageId,
+        conversationId,
+        text: 'Updated text',
+      });
+
+      expect(result?.messageId).toBe(messageId);
+      expect(result?.conversationId).toBe(conversationId);
+      expect(result?.text).toBe('Updated text');
+
+      const updatedMessage = await Message.findOne({ messageId, user: mockCtx.userId });
+      expect(updatedMessage?.text).toBe('Updated text');
+    });
+
+    it('should reject same-user feedback updates when conversationId does not match', async () => {
+      const messageId = uuidv4();
+      const conversationId = uuidv4();
+
+      await saveMessage(mockCtx, {
+        messageId,
+        conversationId,
+        text: 'Original text',
+      });
+
+      await expect(
+        updateMessage(
+          mockCtx.userId,
+          {
+            messageId,
+            conversationId: uuidv4(),
+            feedback: feedbackPayload,
+          },
+          { context: 'updateFeedback' },
+        ),
+      ).rejects.toThrow('Message not found or user not authorized.');
+
+      const unchangedMessage = await Message.findOne({ messageId, user: mockCtx.userId });
+      expect(unchangedMessage?.feedback).toBeUndefined();
+    });
+
+    it('should update feedback when conversationId matches', async () => {
+      const messageId = uuidv4();
+      const conversationId = uuidv4();
+
+      await saveMessage(mockCtx, {
+        messageId,
+        conversationId,
+        text: 'Original text',
+      });
+
+      const result = await updateMessage(
+        mockCtx.userId,
+        {
+          messageId,
+          conversationId,
+          feedback: feedbackPayload,
+        },
+        { context: 'updateFeedback' },
+      );
+
+      expect(result?.messageId).toBe(messageId);
+      expect(result?.conversationId).toBe(conversationId);
+      expect(result?.feedback?.rating).toBe('thumbsDown');
+      expect(result?.feedback?.text).toBe('Needs improvement');
+      expect((result?.feedback?.tag as { key?: string } | undefined)?.key).toBe('other');
+
+      const updatedMessage = await Message.findOne({ messageId, user: mockCtx.userId });
+      expect(updatedMessage?.feedback?.rating).toBe('thumbsDown');
+      expect(updatedMessage?.feedback?.text).toBe('Needs improvement');
+      expect((updatedMessage?.feedback?.tag as { key?: string } | undefined)?.key).toBe(
+        'other',
+      );
     });
 
     it('should throw an error if message is not found', async () => {

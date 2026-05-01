@@ -234,15 +234,19 @@ export function createMessageMethods(mongoose: typeof import('mongoose')): Messa
    */
   async function updateMessage(
     userId: string,
-    message: { messageId: string; [key: string]: unknown },
+    message: { messageId: string; conversationId?: string; [key: string]: unknown },
     metadata?: { context?: string },
   ) {
     try {
       const Message = mongoose.models.Message as Model<IMessage>;
-      const { messageId, ...update } = message;
-      const updatedMessage = await Message.findOneAndUpdate({ messageId, user: userId }, update, {
-        new: true,
-      });
+      const { messageId, conversationId, ...update } = message;
+      const filter: FilterQuery<IMessage> = { messageId, user: userId };
+
+      if (conversationId !== undefined) {
+        filter.conversationId = conversationId;
+      }
+
+      const updatedMessage = await Message.findOneAndUpdate(filter, update, { new: true });
 
       if (!updatedMessage) {
         throw new Error('Message not found or user not authorized.');

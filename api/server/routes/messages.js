@@ -41,9 +41,26 @@ router.get('/', async (req, res) => {
     } else if (search) {
       const searchResults = await db.searchMessages(search, { filter: `user = "${user}"` }, true);
 
-      const messages = searchResults.hits || [];
+      const messages = Array.isArray(searchResults.hits)
+        ? searchResults.hits
+            .map((message) => {
+              if (
+                typeof message?.messageId !== 'string' ||
+                typeof message?.conversationId !== 'string'
+              ) {
+                return null;
+              }
 
-      const result = await db.getConvosQueried(req.user.id, messages, cursor);
+              return {
+                messageId: message.messageId,
+                conversationId: message.conversationId,
+                text: typeof message.text === 'string' ? message.text : '',
+              };
+            })
+            .filter(Boolean)
+        : [];
+
+      const result = await db.getConvosQueried(req.user.id, messages, cursor, pageSize);
 
       const messageIds = [];
       const cleanedMessages = [];
@@ -69,19 +86,31 @@ router.get('/', async (req, res) => {
       for (const message of cleanedMessages) {
         const convo = result.convoMap[message.conversationId];
         const dbMessage = dbMessageMap[message.messageId];
+        if (!dbMessage) {
+          continue;
+        }
 
         activeMessages.push({
-          ...message,
-          title: convo.title,
+          messageId: message.messageId,
           conversationId: message.conversationId,
+          text: message.text,
+          content: Array.isArray(dbMessage.content) ? dbMessage.content : undefined,
+          files: Array.isArray(dbMessage.files) ? dbMessage.files : undefined,
+          unfinished: dbMessage.unfinished === true ? true : undefined,
+          searchResult: true,
+          sender:
+            typeof dbMessage?.sender === 'string'
+              ? dbMessage.sender
+              : undefined,
+          title: convo.title,
           model: convo.model,
-          isCreatedByUser: dbMessage?.isCreatedByUser,
+          isCreatedByUser: dbMessage.isCreatedByUser,
           endpoint: dbMessage?.endpoint,
           iconURL: dbMessage?.iconURL,
         });
       }
 
-      response = { messages: activeMessages, nextCursor: null };
+      response = { messages: activeMessages, nextCursor: result.nextCursor };
     } else {
       response = { messages: [], nextCursor: null };
     }
@@ -279,7 +308,8 @@ router.get('/:conversationId', validateMessageReq, async (req, res) => {
 
 router.post('/:conversationId', validateMessageReq, async (req, res) => {
   try {
-    const message = req.body;
+    const { conversationId } = req.params;
+    const message = { ...req.body, conversationId };
     const reqCtx = {
       userId: req?.user?.id,
       isTemporary: req?.body?.isTemporary,
@@ -322,7 +352,12 @@ router.put('/:conversationId/:messageId', validateMessageReq, async (req, res) =
 
     if (index === undefined) {
       const tokenCount = await countTokens(text, model);
-      const result = await db.updateMessage(req?.user?.id, { messageId, text, tokenCount });
+      const result = await db.updateMessage(req?.user?.id, {
+        conversationId,
+        messageId,
+        text,
+        tokenCount,
+      });
       return res.status(200).json(result);
     }
 
@@ -331,7 +366,7 @@ router.put('/:conversationId/:messageId', validateMessageReq, async (req, res) =
     }
 
     const message = (
-      await db.getMessages({ conversationId, messageId }, 'content tokenCount')
+      await db.getMessages({ conversationId, messageId, user: req.user.id }, 'content tokenCount')
     )?.[0];
     if (!message) {
       return res.status(404).json({ error: 'Message not found' });
@@ -363,6 +398,7 @@ router.put('/:conversationId/:messageId', validateMessageReq, async (req, res) =
     }
 
     const result = await db.updateMessage(req?.user?.id, {
+      conversationId,
       messageId,
       content: updatedContent,
       tokenCount,
@@ -382,6 +418,7 @@ router.put('/:conversationId/:messageId/feedback', validateMessageReq, async (re
     const updatedMessage = await db.updateMessage(
       req?.user?.id,
       {
+        conversationId,
         messageId,
         feedback: feedback || null,
       },

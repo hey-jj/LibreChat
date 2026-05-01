@@ -38,16 +38,71 @@ export type ConversationUpdater = (
 ) => ConversationData;
 
 /* Messages */
-export type MessagesListParams = {
+export type ConversationMessagesListParams = {
   cursor?: string | null;
   sortBy?: 'endpoint' | 'createdAt' | 'updatedAt';
   sortDirection?: 'asc' | 'desc';
   pageSize?: number;
   conversationId?: string;
   messageId?: string;
-  search?: string;
+  search?: never;
 };
 
+/**
+ * Stable reusable contract for GET /api/messages?search=.
+ * `cursor` is the conversation updatedAt cursor emitted as `nextCursor`, and `pageSize`
+ * limits the conversation window examined by the route rather than the final hit count.
+ */
+export type SearchMessagesListParams = {
+  cursor?: string | null;
+  pageSize?: number;
+  search: string;
+  sortBy?: never;
+  sortDirection?: never;
+  conversationId?: never;
+  messageId?: never;
+};
+
+/**
+ * Mixed helper for the current /api/messages route surface.
+ * Reusable clients should prefer the explicit conversation or search-mode types.
+ */
+export type MessagesListParams = ConversationMessagesListParams | SearchMessagesListParams;
+
+export type ConversationMessagesListResponse = {
+  messages: s.TMessage[];
+  nextCursor: string | null;
+};
+
+/**
+ * Exact reusable search-result shape emitted by the shipped search route.
+ * Additional search-hit fields are intentionally excluded from this contract.
+ */
+export type SearchMessageResult = {
+  messageId: string;
+  conversationId: string;
+  text: string;
+  title: string | null;
+  searchResult: true;
+  model?: string | null;
+  isCreatedByUser?: boolean;
+  endpoint?: string;
+  iconURL?: string | null;
+  sender?: string;
+  content?: s.TMessage['content'];
+  files?: s.TMessage['files'];
+  unfinished?: boolean;
+};
+
+export type SearchMessagesListResponse = {
+  messages: SearchMessageResult[];
+  nextCursor: string | null;
+};
+
+/**
+ * Backward-compatible helper for current web data-service usage.
+ * The explicit reusable search-mode contract is `SearchMessagesListResponse`.
+ */
 export type MessagesListResponse = {
   messages: s.TMessage[];
   nextCursor: string | null;
