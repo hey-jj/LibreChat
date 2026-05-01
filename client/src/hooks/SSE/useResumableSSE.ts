@@ -6,16 +6,34 @@ import { useQueryClient } from '@tanstack/react-query';
 import {
   request,
   Constants,
+  ContentTypes,
   QueryKeys,
-  ErrorTypes,
   StepEvents,
   apiBaseUrl,
   createPayload,
-  ViolationTypes,
   removeNullishValues,
 } from 'librechat-data-provider';
-import type { TMessage, TPayload, TSubmission, EventSubmission } from 'librechat-data-provider';
+import type {
+  Agents,
+  TAttachment,
+  TContentData,
+  TConversation,
+  TMessage,
+  TMessageContentParts,
+  TPayload,
+  TSubmission,
+  EventSubmission,
+} from 'librechat-data-provider';
 import type { EventHandlerParams } from './useEventHandlers';
+import {
+  isLegacyAgentAttachmentEvent,
+  isLegacyAgentContentEvent,
+  isLegacyAgentCreatedEvent,
+  isLegacyAgentFinalEvent,
+  isLegacyAgentStreamEvent,
+  isLegacyAgentSyncEvent,
+} from './legacyAgentStream';
+import type { LegacyCreatedEvent, LegacyFinalEvent } from './legacyAgentStream';
 import {
   useGetUserBalance,
   useGetStartupConfig,
@@ -28,7 +46,7 @@ import useEventHandlers from './useEventHandlers';
 import { clearAllDrafts } from '~/utils';
 import store from '~/store';
 
-type ChatHelpers = Pick<
+export type ChatHelpers = Pick<
   EventHandlerParams,
   | 'setMessages'
   | 'getMessages'
@@ -39,6 +57,19 @@ type ChatHelpers = Pick<
 >;
 
 const MAX_RETRIES = 5;
+
+function getStreamText(data: TContentData): string | undefined {
+  if (data.type !== ContentTypes.TEXT) {
+    return undefined;
+  }
+  return typeof data.text === 'string' ? data.text : data.text?.value;
+}
+
+function normalizeAggregatedContent(
+  aggregatedContent: NonNullable<Agents.ResumeState['aggregatedContent']>,
+): TMessageContentParts[] {
+  return aggregatedContent.map((part) => ({ ...part })) as TMessageContentParts[];
+}
 
 /**
  * Hook for resumable SSE streams.
@@ -110,9 +141,9 @@ export default function useResumableSSE(
     finalHandler,
     errorHandler,
     clearStepMaps,
-    messageHandler,
     contentHandler,
     createdHandler,
+    announceReplyStart,
     syncStepMessage,
     attachmentHandler,
     resetContentHandler,
@@ -143,6 +174,86 @@ export default function useResumableSSE(
       let { userMessage } = currentSubmission;
       let textIndex: number | null = null;
 
+      type CreatedHandlerData = Parameters<typeof createdHandler>[0];
+      type FinalHandlerData = Parameters<typeof finalHandler>[0] & {
+        aborted?: boolean;
+        earlyAbort?: boolean;
+        error?: LegacyFinalEvent['error'];
+      };
+      type StepHandlerEvent = Parameters<typeof stepHandler>[0];
+
+      const toRequestMessage = (
+        message: LegacyCreatedEvent['message'] | LegacyFinalEvent['requestMessage'],
+      ): TMessage =>
+        ({
+          ...(currentSubmission.userMessage as TMessage),
+          ...(message ?? {}),
+        }) as TMessage;
+
+      const toResponseMessage = (
+        message: LegacyFinalEvent['responseMessage'] | null | undefined,
+        parentMessageId?: string,
+      ): TMessage =>
+        ({
+          ...(currentSubmission.initialResponse as TMessage),
+          ...(message ?? {}),
+          parentMessageId:
+            message?.parentMessageId ??
+            parentMessageId ??
+            (currentSubmission.initialResponse as TMessage).parentMessageId,
+          conversationId:
+            message?.conversationId ??
+            currentSubmission.conversation?.conversationId ??
+            currentSubmission.userMessage?.conversationId,
+        }) as TMessage;
+
+      const toCreatedHandlerData = (event: LegacyCreatedEvent): CreatedHandlerData => {
+        const requestMessage = toRequestMessage(event.message);
+        return {
+          conversation: currentSubmission.conversation as TConversation,
+          requestMessage,
+          responseMessage: toResponseMessage(undefined, requestMessage.messageId),
+        };
+      };
+
+      const toFinalHandlerData = (event: LegacyFinalEvent): FinalHandlerData => ({
+        ...event,
+        conversation: {
+          conversationId:
+            event.conversation?.conversationId ??
+            currentSubmission.conversation?.conversationId ??
+            currentSubmission.userMessage?.conversationId ??
+            currentStreamId,
+          ...(event.conversation ?? {}),
+        },
+        requestMessage: event.requestMessage ? toRequestMessage(event.requestMessage) : undefined,
+        responseMessage: event.responseMessage
+          ? toResponseMessage(event.responseMessage)
+          : undefined,
+        runMessages: event.runMessages?.map((message) => toResponseMessage(message)),
+      });
+
+      const toStepHandlerEvent = (event: unknown): StepHandlerEvent | null => {
+        if (!isLegacyAgentStreamEvent(event)) {
+          return null;
+        }
+
+        switch (event.event) {
+          case StepEvents.ON_RUN_STEP:
+          case StepEvents.ON_AGENT_UPDATE:
+          case StepEvents.ON_MESSAGE_DELTA:
+          case StepEvents.ON_REASONING_DELTA:
+          case StepEvents.ON_RUN_STEP_DELTA:
+          case StepEvents.ON_RUN_STEP_COMPLETED:
+          case StepEvents.ON_SUMMARIZE_START:
+          case StepEvents.ON_SUMMARIZE_DELTA:
+          case StepEvents.ON_SUMMARIZE_COMPLETE:
+            return event as StepHandlerEvent;
+          default:
+            return null;
+        }
+      };
+
       const baseUrl = `${apiBaseUrl()}/api/agents/chat/stream/${encodeURIComponent(currentStreamId)}`;
       const url = isResume ? `${baseUrl}?resume=true` : baseUrl;
       console.log('[ResumableSSE] Subscribing to stream:', url, { isResume });
@@ -166,15 +277,30 @@ export default function useResumableSSE(
         try {
           const data = JSON.parse(e.data);
 
-          if (data.final != null) {
+          if (isLegacyAgentFinalEvent(data)) {
             console.log('[ResumableSSE] Received FINAL event', {
               aborted: data.aborted,
               conversationId: data.conversation?.conversationId,
               hasResponseMessage: !!data.responseMessage,
             });
             clearAllDrafts(currentSubmission.conversation?.conversationId);
+            if (data.error?.message && !data.requestMessage && !data.responseMessage) {
+              removeActiveJob(currentStreamId);
+              errorHandler({
+                data: {
+                  text: data.error.message,
+                },
+                submission: currentSubmission as EventSubmission,
+              });
+              setIsSubmitting(false);
+              setShowStopButton(false);
+              setStreamId(null);
+              reconnectAttemptRef.current = 0;
+              (startupConfig?.balance?.enabled ?? false) && balanceQuery.refetch();
+              return;
+            }
             try {
-              finalHandler(data, currentSubmission as EventSubmission);
+              finalHandler(toFinalHandlerData(data), currentSubmission as EventSubmission);
             } catch (error) {
               console.error('[ResumableSSE] Error in finalHandler:', error);
               setIsSubmitting(false);
@@ -190,7 +316,7 @@ export default function useResumableSSE(
             return;
           }
 
-          if (data.created != null) {
+          if (isLegacyAgentCreatedEvent(data)) {
             console.log('[ResumableSSE] Received CREATED event', {
               messageId: data.message?.messageId,
               conversationId: data.message?.conversationId,
@@ -202,65 +328,95 @@ export default function useResumableSSE(
               ...data.message,
               overrideParentMessageId: userMessage.overrideParentMessageId,
             };
-            createdHandler(data, { ...currentSubmission, userMessage } as EventSubmission);
+            createdHandler(toCreatedHandlerData(data), {
+              ...currentSubmission,
+              userMessage,
+            } as EventSubmission);
             return;
           }
 
-          if (data.event === 'attachment' && data.data) {
+          if (isLegacyAgentAttachmentEvent(data)) {
             attachmentHandler({
-              data: data.data,
+              data: data.data as TAttachment,
               submission: currentSubmission as EventSubmission,
             });
             return;
           }
 
-          if (data.event != null) {
-            stepHandler(data, { ...currentSubmission, userMessage } as EventSubmission);
+          const stepEvent = toStepHandlerEvent(data);
+          if (stepEvent) {
+            stepHandler(stepEvent, { ...currentSubmission, userMessage } as EventSubmission);
             return;
           }
 
-          if (data.sync != null) {
+          if (isLegacyAgentSyncEvent(data)) {
             console.log('[ResumableSSE] SYNC received', {
-              runSteps: data.resumeState?.runSteps?.length ?? 0,
-              pendingEvents: data.pendingEvents?.length ?? 0,
+              runSteps: data.resumeState.runSteps.length,
+              pendingEvents: data.pendingEvents.length,
             });
+
+            const pendingCreatedEvents = data.pendingEvents.filter(
+              (pendingEvent): pendingEvent is LegacyCreatedEvent =>
+                isLegacyAgentCreatedEvent(pendingEvent),
+            );
+            if (pendingCreatedEvents.length === 0) {
+              announceReplyStart();
+            }
 
             const runId = v4();
             setActiveRunId(runId);
+            userMessage = {
+              ...userMessage,
+              ...data.resumeState.userMessage,
+              overrideParentMessageId: userMessage.overrideParentMessageId,
+            };
+            currentSubmission = {
+              ...currentSubmission,
+              userMessage,
+              initialResponse: {
+                ...(currentSubmission.initialResponse as TMessage),
+                messageId: data.resumeState.responseMessageId,
+                parentMessageId: userMessage.messageId,
+                conversationId:
+                  userMessage.conversationId ?? currentSubmission.conversation?.conversationId,
+              } as TMessage,
+            };
+            submissionRef.current = currentSubmission;
 
-            if (data.resumeState?.runSteps) {
-              for (const runStep of data.resumeState.runSteps) {
-                stepHandler({ event: StepEvents.ON_RUN_STEP, data: runStep }, {
-                  ...currentSubmission,
-                  userMessage,
-                } as EventSubmission);
-              }
+            for (const pendingCreatedEvent of pendingCreatedEvents) {
+              userMessage = {
+                ...userMessage,
+                ...pendingCreatedEvent.message,
+                overrideParentMessageId: userMessage.overrideParentMessageId,
+              };
+              createdHandler(toCreatedHandlerData(pendingCreatedEvent), {
+                ...currentSubmission,
+                userMessage,
+              } as EventSubmission);
             }
 
-            if (data.resumeState?.aggregatedContent && userMessage?.messageId) {
-              const messages = getMessages() ?? [];
-              const userMsgId = userMessage.messageId;
-              const serverResponseId = data.resumeState.responseMessageId;
+            for (const runStep of data.resumeState.runSteps) {
+              stepHandler({ event: StepEvents.ON_RUN_STEP, data: runStep }, {
+                ...currentSubmission,
+                userMessage,
+              } as EventSubmission);
+            }
 
-              let responseIdx = -1;
-              if (serverResponseId) {
-                responseIdx = messages.findIndex((m) => m.messageId === serverResponseId);
-              }
-              if (responseIdx < 0) {
-                responseIdx = messages.findIndex(
-                  (m) =>
-                    !m.isCreatedByUser &&
-                    (m.messageId === `${userMsgId}_` || m.parentMessageId === userMsgId),
-                );
-              }
+            const aggregatedContent = data.resumeState.aggregatedContent;
+            if (aggregatedContent && aggregatedContent.length > 0) {
+              const messages = getMessages() ?? [];
+              const userMsgId = data.resumeState.userMessage.messageId;
+              const responseMessageId = data.resumeState.responseMessageId;
+              const restoredContent = normalizeAggregatedContent(aggregatedContent);
+              const responseIdx = messages.findIndex((m) => m.messageId === responseMessageId);
 
               console.log('[ResumableSSE] SYNC update', {
                 userMsgId,
-                serverResponseId,
+                responseMessageId,
                 responseIdx,
                 foundMessageId: responseIdx >= 0 ? messages[responseIdx]?.messageId : null,
                 messagesCount: messages.length,
-                aggregatedContentLength: data.resumeState.aggregatedContent?.length,
+                aggregatedContentLength: restoredContent.length,
               });
 
               if (responseIdx >= 0) {
@@ -268,25 +424,24 @@ export default function useResumableSSE(
                 const oldContent = updated[responseIdx]?.content;
                 updated[responseIdx] = {
                   ...updated[responseIdx],
-                  content: data.resumeState.aggregatedContent,
+                  content: restoredContent,
                 };
                 console.log('[ResumableSSE] SYNC updating message', {
                   messageId: updated[responseIdx]?.messageId,
                   oldContentLength: Array.isArray(oldContent) ? oldContent.length : 0,
-                  newContentLength: data.resumeState.aggregatedContent?.length,
+                  newContentLength: restoredContent.length,
                 });
                 setMessages(updated);
                 resetContentHandler();
                 syncStepMessage(updated[responseIdx]);
                 console.log('[ResumableSSE] SYNC complete, handlers synced');
               } else {
-                const responseId = serverResponseId ?? `${userMsgId}_`;
                 const newMessage = {
-                  messageId: responseId,
+                  messageId: responseMessageId,
                   parentMessageId: userMsgId,
                   conversationId: currentSubmission.conversation?.conversationId ?? '',
                   text: '',
-                  content: data.resumeState.aggregatedContent,
+                  content: restoredContent,
                   isCreatedByUser: false,
                 } as TMessage;
                 setMessages([...messages, newMessage]);
@@ -295,13 +450,33 @@ export default function useResumableSSE(
               }
             }
 
-            if (data.pendingEvents?.length > 0) {
+            if (data.pendingEvents.length > 0) {
               console.log(`[ResumableSSE] Replaying ${data.pendingEvents.length} pending events`);
-              const submission = { ...currentSubmission, userMessage } as EventSubmission;
               for (const pendingEvent of data.pendingEvents) {
-                if (pendingEvent.event != null) {
-                  stepHandler(pendingEvent, submission);
-                } else if (pendingEvent.type != null) {
+                const submission = { ...currentSubmission, userMessage } as EventSubmission;
+
+                if (isLegacyAgentCreatedEvent(pendingEvent)) {
+                  continue;
+                }
+
+                if (isLegacyAgentAttachmentEvent(pendingEvent)) {
+                  attachmentHandler({
+                    data: pendingEvent.data as TAttachment,
+                    submission,
+                  });
+                } else {
+                  const pendingStepEvent = toStepHandlerEvent(pendingEvent);
+                  if (pendingStepEvent) {
+                    stepHandler(pendingStepEvent, submission);
+                    continue;
+                  }
+                }
+                if (isLegacyAgentContentEvent(pendingEvent)) {
+                  const text = getStreamText(pendingEvent);
+                  const { index } = pendingEvent;
+                  if (text != null && index !== textIndex) {
+                    textIndex = index;
+                  }
                   contentHandler({ data: pendingEvent, submission });
                 }
               }
@@ -312,23 +487,14 @@ export default function useResumableSSE(
             return;
           }
 
-          if (data.type != null) {
-            const { text, index } = data;
+          if (isLegacyAgentContentEvent(data)) {
+            const text = getStreamText(data);
+            const { index } = data;
             if (text != null && index !== textIndex) {
               textIndex = index;
             }
             contentHandler({ data, submission: currentSubmission as EventSubmission });
             return;
-          }
-
-          if (data.message != null) {
-            const text = data.text ?? data.response;
-            const initialResponse = {
-              ...(currentSubmission.initialResponse as TMessage),
-              parentMessageId: data.parentMessageId,
-              messageId: data.messageId,
-            };
-            messageHandler(text, { ...currentSubmission, userMessage, initialResponse });
           }
         } catch (error) {
           console.error('[ResumableSSE] Error processing message:', error);
@@ -336,11 +502,10 @@ export default function useResumableSSE(
       });
 
       /**
-       * Error event handler - handles BOTH:
-       * 1. HTTP-level errors (responseCode present) - 404, 401, network failures
-       * 2. Server-sent error events (event: error with data) - known errors like ViolationTypes/ErrorTypes
+       * Error event handler - handles HTTP-level failures and transport drops.
+       * Application-level terminal errors must arrive as in-band final message events.
        *
-       * Order matters: check responseCode first since HTTP errors may also include data
+       * Order matters: check responseCode first since HTTP errors may also include data.
        */
       sse.addEventListener('error', async (e: MessageEvent) => {
         (startupConfig?.balance?.enabled ?? false) && balanceQuery.refetch();
@@ -387,60 +552,15 @@ export default function useResumableSSE(
           }
         }
 
-        /**
-         * Server-sent error event (event: error with data) - no responseCode.
-         * These are known errors (ErrorTypes, ViolationTypes) that should be displayed to user.
-         * Only check e.data if there's no HTTP responseCode, since HTTP errors may also have body data.
-         */
         if (!responseCode && e.data) {
-          console.log('[ResumableSSE] Server-sent error event received:', e.data);
-          sse.close();
-          removeActiveJob(currentStreamId);
-
-          try {
-            const errorData = JSON.parse(e.data);
-            const errorString = errorData.error ?? errorData.message ?? JSON.stringify(errorData);
-
-            // Check if it's a known error type (ViolationTypes or ErrorTypes)
-            let isKnownError = false;
-            try {
-              const parsed =
-                typeof errorString === 'string' ? JSON.parse(errorString) : errorString;
-              const errorType = parsed?.type ?? parsed?.code;
-              if (errorType) {
-                const violationValues = Object.values(ViolationTypes) as string[];
-                const errorTypeValues = Object.values(ErrorTypes) as string[];
-                isKnownError =
-                  violationValues.includes(errorType) || errorTypeValues.includes(errorType);
-              }
-            } catch {
-              // Not JSON or parsing failed - treat as generic error
-            }
-
-            console.log('[ResumableSSE] Error type check:', { isKnownError, errorString });
-
-            // Display the error to user via errorHandler
-            errorHandler({
-              data: { text: errorString } as unknown as Parameters<typeof errorHandler>[0]['data'],
-              submission: currentSubmission as EventSubmission,
-            });
-          } catch (parseError) {
-            console.error('[ResumableSSE] Failed to parse server error:', parseError);
-            errorHandler({
-              data: { text: e.data } as unknown as Parameters<typeof errorHandler>[0]['data'],
-              submission: currentSubmission as EventSubmission,
-            });
-          }
-
-          setIsSubmitting(false);
-          setShowStopButton(false);
-          setStreamId(null);
-          reconnectAttemptRef.current = 0;
-          return;
+          console.warn(
+            '[ResumableSSE] Unexpected SSE error event payload received; treating as transport failure',
+            { currentStreamId },
+          );
         }
 
         // Network failure or unknown HTTP error - attempt reconnection with backoff
-        console.log('[ResumableSSE] Stream error (network failure) - will attempt reconnect', {
+        console.log('[ResumableSSE] Stream error (transport failure) - will attempt reconnect', {
           responseCode,
           hasData: !!e.data,
         });
@@ -537,13 +657,13 @@ export default function useResumableSSE(
       setShowStopButton,
       finalHandler,
       createdHandler,
+      announceReplyStart,
       attachmentHandler,
       stepHandler,
       contentHandler,
       resetContentHandler,
       syncStepMessage,
       clearStepMaps,
-      messageHandler,
       errorHandler,
       setIsSubmitting,
       getMessages,
@@ -607,9 +727,7 @@ export default function useResumableSSE(
       const errorData = axiosError?.response?.data;
       if (errorData) {
         errorHandler({
-          data: { text: JSON.stringify(errorData) } as unknown as Parameters<
-            typeof errorHandler
-          >[0]['data'],
+          data: { text: JSON.stringify(errorData) },
           submission: currentSubmission as EventSubmission,
         });
       } else {

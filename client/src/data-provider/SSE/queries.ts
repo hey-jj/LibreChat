@@ -11,6 +11,11 @@ export interface StreamStatusResponse {
   aggregatedContent?: Array<{ type: string; text?: string }>;
   createdAt?: number;
   resumeState?: Agents.ResumeState;
+  resumeStateStatus?: 'available' | 'unavailable';
+  resumeError?: {
+    code: string;
+    message: string;
+  } | null;
 }
 
 export const streamStatusQueryKey = (conversationId: string) => ['streamStatus', conversationId];

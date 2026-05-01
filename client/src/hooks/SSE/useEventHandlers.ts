@@ -186,6 +186,13 @@ export default function useEventHandlers({
   const lastAnnouncementTimeRef = useRef(Date.now());
   const { conversationId: paramId } = useParams();
   const { token } = useAuthContext();
+  const announceReplyStart = useCallback(() => {
+    lastAnnouncementTimeRef.current = Date.now();
+    announcePolite({
+      message: 'start',
+      isStatus: true,
+    });
+  }, [announcePolite]);
 
   const { contentHandler, resetContentHandler } = useContentHandler({ setMessages, getMessages });
   const { stepHandler, clearStepMaps, syncStepMessage } = useStepHandler({
@@ -283,10 +290,7 @@ export default function useEventHandlers({
         },
       ]);
 
-      announcePolite({
-        message: 'start',
-        isStatus: true,
-      });
+      announceReplyStart();
 
       let update = {} as TConversation;
       if (setConversation && !isAddedRequest) {
@@ -335,7 +339,7 @@ export default function useEventHandlers({
       queryClient,
       setMessages,
       isAddedRequest,
-      announcePolite,
+      announceReplyStart,
       setConversation,
       setShowStopButton,
       resetLatestMessage,
@@ -347,23 +351,27 @@ export default function useEventHandlers({
       queryClient.invalidateQueries([QueryKeys.mcpConnectionStatus]);
       queryClient.invalidateQueries([QueryKeys.mcpTools]);
       const { messages, userMessage, isRegenerate = false, isTemporary = false } = submission;
+      const responseMessageId =
+        data.responseMessage?.messageId != null
+          ? data.responseMessage.messageId
+          : userMessage.messageId + '_';
       const initialResponse = {
         ...submission.initialResponse,
-        parentMessageId: userMessage.messageId,
-        messageId: userMessage.messageId + '_',
+        parentMessageId: data.responseMessage?.parentMessageId ?? userMessage.messageId,
+        messageId: responseMessageId,
       };
+      const nextMessages = messages.filter(
+        (message) =>
+          message.messageId !== userMessage.messageId && message.messageId !== responseMessageId,
+      );
       if (isRegenerate) {
-        setMessages([...messages, initialResponse]);
+        setMessages([...nextMessages, initialResponse]);
       } else {
-        setMessages([...messages, userMessage, initialResponse]);
+        setMessages([...nextMessages, userMessage, initialResponse]);
       }
 
       const { conversationId, parentMessageId } = userMessage;
-      lastAnnouncementTimeRef.current = Date.now();
-      announcePolite({
-        message: 'start',
-        isStatus: true,
-      });
+      announceReplyStart();
 
       let update = {} as TConversation;
       if (setConversation && !isAddedRequest) {
@@ -421,7 +429,7 @@ export default function useEventHandlers({
       queryClient,
       setAbortScroll,
       isAddedRequest,
-      announcePolite,
+      announceReplyStart,
       setConversation,
       resetLatestMessage,
       applyAgentTemplate,
@@ -619,7 +627,13 @@ export default function useEventHandlers({
   );
 
   const errorHandler = useCallback(
-    ({ data, submission }: { data?: TResData; submission: EventSubmission }) => {
+    ({
+      data,
+      submission,
+    }: {
+      data?: TResData | Partial<TMessage>;
+      submission: EventSubmission;
+    }) => {
       const { messages, userMessage, initialResponse } = submission;
       setCompleted((prev) => new Set(prev.add(initialResponse.messageId)));
 
@@ -849,6 +863,7 @@ export default function useEventHandlers({
     messageHandler,
     contentHandler,
     createdHandler,
+    announceReplyStart,
     syncStepMessage,
     attachmentHandler,
     abortConversation,
