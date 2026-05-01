@@ -5,6 +5,7 @@ import {
   resolveThinkingDisplay,
   bedrockOutputParser,
   bedrockInputParser,
+  bedrockInputSchema,
   supportsContext1m,
 } from '../src/bedrock';
 
@@ -621,6 +622,91 @@ describe('bedrockInputParser', () => {
       }) as Record<string, unknown>;
       const additionalFields = result.additionalModelRequestFields as Record<string, unknown>;
       expect(additionalFields?.thinkingDisplay).toBeUndefined();
+    });
+
+    test('thinkingDisplay is stripped when adaptive thinking is disabled', () => {
+      const result = bedrockInputParser.parse({
+        model: 'anthropic.claude-opus-4-7',
+        thinking: false,
+        thinkingDisplay: ThinkingDisplay.summarized,
+      }) as Record<string, unknown>;
+      const additionalFields = result.additionalModelRequestFields as Record<string, unknown>;
+      expect(additionalFields.thinking).toBeUndefined();
+      expect(additionalFields.thinkingBudget).toBeUndefined();
+      expect(additionalFields.thinkingDisplay).toBeUndefined();
+    });
+
+    test('round-trips persisted display from AMRF.thinking.display (Opus 4.7 omitted)', () => {
+      /** Simulates a persisted conversation where the prior parse already set
+       * display on the nested AMRF.thinking object but did not persist the
+       * top-level thinkingDisplay field. The schema (bedrockInputSchema) should
+       * recover display → thinkingDisplay so the parser can honor the explicit
+       * choice on subsequent requests. */
+      const persisted = bedrockInputSchema.parse({
+        model: 'anthropic.claude-opus-4-7',
+        additionalModelRequestFields: {
+          thinking: { type: 'adaptive', display: 'omitted' },
+        },
+      }) as Record<string, unknown>;
+      expect(persisted.thinkingDisplay).toBe('omitted');
+    });
+
+    test('round-trips persisted display from AMRF.thinking.display (summarized)', () => {
+      const persisted = bedrockInputSchema.parse({
+        model: 'anthropic.claude-opus-4-6-v1',
+        additionalModelRequestFields: {
+          thinking: { type: 'adaptive', display: 'summarized' },
+        },
+      }) as Record<string, unknown>;
+      expect(persisted.thinkingDisplay).toBe('summarized');
+    });
+
+    test('ignores unknown display values during round-trip extraction', () => {
+      const persisted = bedrockInputSchema.parse({
+        model: 'anthropic.claude-opus-4-7',
+        additionalModelRequestFields: {
+          thinking: { type: 'adaptive', display: 'bogus' },
+        },
+      }) as Record<string, unknown>;
+      expect(persisted.thinkingDisplay).toBeUndefined();
+    });
+
+    test('top-level thinkingDisplay wins over persisted AMRF display', () => {
+      const persisted = bedrockInputSchema.parse({
+        model: 'anthropic.claude-opus-4-7',
+        thinkingDisplay: ThinkingDisplay.omitted,
+        additionalModelRequestFields: {
+          thinking: { type: 'adaptive', display: 'summarized' },
+        },
+      }) as Record<string, unknown>;
+      expect(persisted.thinkingDisplay).toBe(ThinkingDisplay.omitted);
+    });
+
+    test('bedrockInputParser preserves persisted AMRF.thinking.display (Opus 4.7 omitted)', () => {
+      /** initializeBedrock calls bedrockInputParser directly on persisted
+       * model_parameters. Without the parser-side extraction, the 'omitted'
+       * user choice baked into AMRF would be silently reverted to
+       * 'summarized' by the Opus 4.7+ auto fallback. */
+      const result = bedrockInputParser.parse({
+        model: 'anthropic.claude-opus-4-7',
+        additionalModelRequestFields: {
+          thinking: { type: 'adaptive', display: 'omitted' },
+        },
+      }) as Record<string, unknown>;
+      const amrf = result.additionalModelRequestFields as Record<string, unknown>;
+      expect(amrf.thinking).toEqual({ type: 'adaptive', display: 'omitted' });
+    });
+
+    test('bedrockInputParser: top-level thinkingDisplay wins over persisted AMRF display', () => {
+      const result = bedrockInputParser.parse({
+        model: 'anthropic.claude-opus-4-7',
+        thinkingDisplay: ThinkingDisplay.summarized,
+        additionalModelRequestFields: {
+          thinking: { type: 'adaptive', display: 'omitted' },
+        },
+      }) as Record<string, unknown>;
+      const amrf = result.additionalModelRequestFields as Record<string, unknown>;
+      expect(amrf.thinking).toEqual({ type: 'adaptive', display: 'summarized' });
     });
 
     test('should not include output_config when effort is unset (empty string)', () => {

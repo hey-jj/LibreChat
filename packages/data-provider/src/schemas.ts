@@ -189,10 +189,10 @@ export enum AnthropicEffort {
 /**
  * Controls whether the model's reasoning content is returned in responses.
  *
- * - `'auto'` — LibreChat decides: opt in to `'summarized'` for models that
+ * - `'auto'` - LibreChat decides: opt in to `'summarized'` for models that
  *   omit by default (Opus 4.7+), leave the field off for older models.
- * - `'summarized'` — always request a post-hoc summary of the reasoning.
- * - `'omitted'` — always suppress reasoning content. Slightly lower latency.
+ * - `'summarized'` - always request a post-hoc summary of the reasoning.
+ * - `'omitted'` - always suppress reasoning content. Slightly lower latency.
  *
  * See https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7#thinking-content-omitted-by-default
  */
@@ -201,6 +201,12 @@ export enum ThinkingDisplay {
   summarized = 'summarized',
   omitted = 'omitted',
 }
+
+/**
+ * Wire-level values accepted by the Anthropic Messages API `thinking.display`
+ * field. Excludes the LibreChat-only `'auto'` sentinel.
+ */
+export type ThinkingDisplayWireValue = Exclude<ThinkingDisplay, ThinkingDisplay.auto>;
 
 export enum BedrockReasoningConfig {
   low = 'low',
@@ -949,7 +955,13 @@ export const tQueryParamsSchema = tConversationSchema
     }),
   );
 
-/** Narrowed preset schema for use in model specs — omits system/DB/deprecated fields */
+/** Narrowed preset schema for use in model specs — omits system/DB/deprecated fields.
+ *
+ * `greeting` and `iconURL` are admin-configurable display fields on a model spec's
+ * preset (landing greeting, preset-level icon fallback) and must be preserved.
+ * `spec` is set by the client from `modelSpec.name` via `getModelSpecPreset` and is
+ * omitted to avoid duplicate configuration surface.
+ */
 export const tModelSpecPresetSchema = tPresetSchema.omit({
   conversationId: true,
   presetId: true,
@@ -966,8 +978,6 @@ export const tModelSpecPresetSchema = tPresetSchema.omit({
   resendImages: true,
   chatGptLabel: true,
   presetOverride: true,
-  greeting: true,
-  iconURL: true,
   spec: true,
 });
 

@@ -6,11 +6,9 @@ const DEFAULT_THINKING_BUDGET = 2000;
 
 const bedrockReasoningConfigValues = new Set<string>(Object.values(s.BedrockReasoningConfig));
 
-type ThinkingDisplayValue = 'summarized' | 'omitted';
-
 type ThinkingConfig =
   | { type: 'enabled'; budget_tokens: number }
-  | { type: 'adaptive'; display?: ThinkingDisplayValue };
+  | { type: 'adaptive'; display?: s.ThinkingDisplayWireValue };
 
 /**
  * Resolves the final `thinking.display` value for an adaptive-thinking request.
@@ -23,18 +21,35 @@ type ThinkingConfig =
  *
  * See https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7#thinking-content-omitted-by-default
  */
+/**
+ * Safely extracts a nested `thinking.display` string from a persisted
+ * `additionalModelRequestFields` object, returning `undefined` if the shape
+ * isn't what we expect.
+ */
+function extractPersistedDisplay(amrf: unknown): string | undefined {
+  if (typeof amrf !== 'object' || amrf === null) {
+    return undefined;
+  }
+  const thinking = (amrf as Record<string, unknown>).thinking;
+  if (typeof thinking !== 'object' || thinking === null) {
+    return undefined;
+  }
+  const display = (thinking as Record<string, unknown>).display;
+  return typeof display === 'string' ? display : undefined;
+}
+
 export function resolveThinkingDisplay(
   model: string,
   explicit?: s.ThinkingDisplay | string | null,
-): ThinkingDisplayValue | undefined {
+): s.ThinkingDisplayWireValue | undefined {
   if (explicit === s.ThinkingDisplay.summarized) {
-    return 'summarized';
+    return s.ThinkingDisplay.summarized;
   }
   if (explicit === s.ThinkingDisplay.omitted) {
-    return 'omitted';
+    return s.ThinkingDisplay.omitted;
   }
   if (omitsThinkingByDefault(model)) {
-    return 'summarized';
+    return s.ThinkingDisplay.summarized;
   }
   return undefined;
 }
@@ -201,6 +216,15 @@ export const bedrockInputSchema = s.tConversationSchema
         typeof thinking === 'object' && 'budget_tokens' in thinking
           ? thinking.budget_tokens
           : undefined;
+      if (obj.thinkingDisplay == null) {
+        const persistedDisplay = extractPersistedDisplay({ thinking });
+        if (
+          persistedDisplay === s.ThinkingDisplay.summarized ||
+          persistedDisplay === s.ThinkingDisplay.omitted
+        ) {
+          obj.thinkingDisplay = persistedDisplay as s.ThinkingDisplay;
+        }
+      }
       delete obj.additionalModelRequestFields;
     }
     return s.removeNullishValues(obj);
@@ -293,11 +317,26 @@ export const bedrockInputParser = s.tConversationSchema
         if (additionalFields.thinking === false) {
           delete additionalFields.thinking;
           delete additionalFields.thinkingBudget;
+          delete additionalFields.thinkingDisplay;
         } else {
+          /**
+           * Persisted agent `model_parameters` round-trip back through this
+           * parser with the prior `thinking.display` embedded in
+           * `additionalModelRequestFields`. Surface it as the resolver's
+           * explicit value when no top-level `thinkingDisplay` is set so the
+           * prior user choice (e.g. 'omitted') survives instead of being
+           * clobbered by the Opus 4.7+ auto → 'summarized' fallback.
+           */
+          const topLevelDisplay = additionalFields.thinkingDisplay as
+            | s.ThinkingDisplay
+            | string
+            | null
+            | undefined;
+          const persistedDisplay = extractPersistedDisplay(typedData.additionalModelRequestFields);
           const thinkingConfig: ThinkingConfig = { type: 'adaptive' };
           const display = resolveThinkingDisplay(
             typedData.model as string,
-            additionalFields.thinkingDisplay as s.ThinkingDisplay | string | null | undefined,
+            topLevelDisplay ?? persistedDisplay,
           );
           if (display) {
             thinkingConfig.display = display;
