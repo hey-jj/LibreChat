@@ -151,6 +151,7 @@ jest.mock('~/models', () => ({
   getAgent: jest.fn().mockResolvedValue({ id: 'agent-123', name: 'Test Agent' }),
   getFiles: jest.fn(),
   getUserKey: jest.fn(),
+  getMessage: jest.fn().mockResolvedValue(null),
   getMessages: jest.fn().mockResolvedValue([]),
   saveMessage: jest.fn().mockResolvedValue({}),
   updateFilesUsage: jest.fn(),
@@ -206,8 +207,9 @@ describe('createResponse controller', () => {
 
   describe('conversation ownership validation', () => {
     it('should skip ownership check when previous_response_id is not provided', async () => {
-      const { getConvo } = require('~/models');
+      const { getConvo, getMessage } = require('~/models');
       await createResponse(req, res);
+      expect(getMessage).not.toHaveBeenCalled();
       expect(getConvo).not.toHaveBeenCalled();
     });
 
@@ -231,9 +233,9 @@ describe('createResponse controller', () => {
       );
     });
 
-    it('should return 404 when conversation is not owned by user', async () => {
+    it('should return 404 when previous response is not owned by user', async () => {
       const { validateResponseRequest, sendResponsesErrorResponse } = require('@librechat/api');
-      const { getConvo } = require('~/models');
+      const { getConvo, getMessage } = require('~/models');
       validateResponseRequest.mockReturnValueOnce({
         request: {
           model: 'agent-123',
@@ -242,21 +244,23 @@ describe('createResponse controller', () => {
           previous_response_id: 'resp_abc',
         },
       });
-      getConvo.mockResolvedValueOnce(null);
+      getMessage.mockResolvedValueOnce(null);
 
       await createResponse(req, res);
-      expect(getConvo).toHaveBeenCalledWith('user-123', 'resp_abc');
+      expect(getMessage).toHaveBeenCalledWith({ user: 'user-123', messageId: 'resp_abc' });
+      expect(getConvo).not.toHaveBeenCalled();
       expect(sendResponsesErrorResponse).toHaveBeenCalledWith(
         res,
         404,
-        'Conversation not found',
+        'Previous response not found: resp_abc',
         'not_found',
+        'response_not_found',
       );
     });
 
-    it('should proceed when conversation is owned by user', async () => {
+    it('should proceed when previous response resolves to a stored conversation', async () => {
       const { validateResponseRequest, sendResponsesErrorResponse } = require('@librechat/api');
-      const { getConvo } = require('~/models');
+      const { getConvo, getMessage, getMessages } = require('~/models');
       validateResponseRequest.mockReturnValueOnce({
         request: {
           model: 'agent-123',
@@ -265,10 +269,21 @@ describe('createResponse controller', () => {
           previous_response_id: 'resp_abc',
         },
       });
-      getConvo.mockResolvedValueOnce({ conversationId: 'resp_abc', user: 'user-123' });
+      getMessage.mockResolvedValueOnce({
+        conversationId: 'mock-uuid-456',
+        isCreatedByUser: false,
+        metadata: {
+          response_snapshot: { id: 'resp_abc', object: 'response' },
+        },
+      });
 
       await createResponse(req, res);
-      expect(getConvo).toHaveBeenCalledWith('user-123', 'resp_abc');
+      expect(getMessage).toHaveBeenCalledWith({ user: 'user-123', messageId: 'resp_abc' });
+      expect(getConvo).not.toHaveBeenCalled();
+      expect(getMessages).toHaveBeenCalledWith({
+        conversationId: 'mock-uuid-456',
+        user: 'user-123',
+      });
       expect(sendResponsesErrorResponse).not.toHaveBeenCalledWith(
         res,
         404,
@@ -277,9 +292,37 @@ describe('createResponse controller', () => {
       );
     });
 
-    it('should return 500 when getConvo throws a DB error', async () => {
+    it('should return 409 when previous response lacks an exact snapshot', async () => {
       const { validateResponseRequest, sendResponsesErrorResponse } = require('@librechat/api');
-      const { getConvo } = require('~/models');
+      const { getMessage } = require('~/models');
+      validateResponseRequest.mockReturnValueOnce({
+        request: {
+          model: 'agent-123',
+          input: 'Hello',
+          stream: false,
+          previous_response_id: 'resp_legacy',
+        },
+      });
+      getMessage.mockResolvedValueOnce({
+        conversationId: 'mock-uuid-456',
+        isCreatedByUser: false,
+        metadata: {},
+      });
+
+      await createResponse(req, res);
+
+      expect(sendResponsesErrorResponse).toHaveBeenCalledWith(
+        res,
+        409,
+        'Stored response resp_legacy does not include an exact persisted snapshot; this legacy record cannot be used as previous_response_id.',
+        'invalid_state',
+        'response_snapshot_unavailable',
+      );
+    });
+
+    it('should return 500 when getMessage throws a DB error for a response reference', async () => {
+      const { validateResponseRequest, sendResponsesErrorResponse } = require('@librechat/api');
+      const { getConvo, getMessage } = require('~/models');
       validateResponseRequest.mockReturnValueOnce({
         request: {
           model: 'agent-123',
@@ -288,9 +331,11 @@ describe('createResponse controller', () => {
           previous_response_id: 'resp_abc',
         },
       });
-      getConvo.mockRejectedValueOnce(new Error('DB connection failed'));
+      getMessage.mockRejectedValueOnce(new Error('DB connection failed'));
 
       await createResponse(req, res);
+      expect(getMessage).toHaveBeenCalledWith({ user: 'user-123', messageId: 'resp_abc' });
+      expect(getConvo).not.toHaveBeenCalled();
       expect(sendResponsesErrorResponse).toHaveBeenCalledWith(
         res,
         500,
@@ -430,5 +475,77 @@ describe('createResponse controller', () => {
         }),
       );
     });
+  });
+});
+
+describe('getResponse controller', () => {
+  let getResponse;
+  let req, res;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    const controller = require('../responses');
+    getResponse = controller.getResponse;
+
+    req = {
+      params: { id: 'resp_123' },
+      user: { id: 'user-123' },
+    };
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn(),
+    };
+  });
+
+  it('should return a stored response snapshot from message metadata', async () => {
+    const { getMessage } = require('~/models');
+    const { sendResponsesErrorResponse } = require('@librechat/api');
+    const storedSnapshot = {
+      id: 'resp_123',
+      status: 'completed',
+      output: [
+        {
+          type: 'message',
+          content: [{ type: 'output_text', text: 'Hello from the stored snapshot' }],
+        },
+      ],
+    };
+
+    getMessage.mockResolvedValueOnce({
+      isCreatedByUser: false,
+      metadata: {
+        response_snapshot: storedSnapshot,
+      },
+    });
+
+    await getResponse(req, res);
+
+    expect(getMessage).toHaveBeenCalledWith({ user: 'user-123', messageId: 'resp_123' });
+    expect(res.json).toHaveBeenCalledWith(storedSnapshot);
+    expect(sendResponsesErrorResponse).not.toHaveBeenCalled();
+  });
+
+  it('should return a truthful error when a legacy stored response lacks an exact snapshot', async () => {
+    const { getMessage } = require('~/models');
+    const { sendResponsesErrorResponse } = require('@librechat/api');
+
+    req.params.id = 'resp_legacy';
+    getMessage.mockResolvedValueOnce({
+      isCreatedByUser: false,
+      metadata: {},
+    });
+
+    await getResponse(req, res);
+
+    expect(getMessage).toHaveBeenCalledWith({ user: 'user-123', messageId: 'resp_legacy' });
+    expect(sendResponsesErrorResponse).toHaveBeenCalledWith(
+      res,
+      409,
+      'Stored response resp_legacy does not include an exact persisted snapshot; this legacy record cannot be returned truthfully.',
+      'invalid_state',
+      'response_snapshot_unavailable',
+    );
   });
 });

@@ -769,6 +769,8 @@ export interface ResponseContext {
   previousResponseId?: string;
   /** Instructions */
   instructions?: string;
+  /** Whether the response should be stored for later retrieval */
+  store: boolean;
 }
 
 /** Validation result for requests */

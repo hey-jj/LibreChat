@@ -163,7 +163,7 @@ export function buildResponse(
       : null,
     max_output_tokens: null,
     max_tool_calls: null,
-    store: false,
+    store: context.store,
     background: false,
     service_tier: 'default',
     metadata: {},
@@ -900,15 +900,67 @@ export function updateTrackerUsage(
   },
 ): void {
   if (usage.promptTokens != null) {
-    tracker.usage.inputTokens = usage.promptTokens;
+    tracker.usage.inputTokens += usage.promptTokens;
   }
   if (usage.completionTokens != null) {
-    tracker.usage.outputTokens = usage.completionTokens;
+    tracker.usage.outputTokens += usage.completionTokens;
   }
   if (usage.reasoningTokens != null) {
-    tracker.usage.reasoningTokens = usage.reasoningTokens;
+    tracker.usage.reasoningTokens += usage.reasoningTokens;
   }
   if (usage.cachedTokens != null) {
-    tracker.usage.cachedTokens = usage.cachedTokens;
+    tracker.usage.cachedTokens += usage.cachedTokens;
   }
+}
+
+export interface UsageMetadataSource {
+  input_tokens?: number;
+  output_tokens?: number;
+  input_token_details?: {
+    cache_creation?: number;
+    cache_read?: number;
+  };
+  output_token_details?: {
+    reasoning?: number;
+  };
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+}
+
+function getUsageNumber(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+export function extractUsageUpdate(usage: UsageMetadataSource | null | undefined): {
+  promptTokens?: number;
+  completionTokens?: number;
+  reasoningTokens?: number;
+  cachedTokens?: number;
+} | null {
+  if (!usage) {
+    return null;
+  }
+
+  const promptTokens = getUsageNumber(usage.input_tokens);
+  const completionTokens = getUsageNumber(usage.output_tokens);
+  const reasoningTokens = getUsageNumber(usage.output_token_details?.reasoning);
+  const cachedTokens = getUsageNumber(
+    usage.input_token_details?.cache_read ?? usage.cache_read_input_tokens,
+  );
+
+  if (
+    promptTokens == null &&
+    completionTokens == null &&
+    reasoningTokens == null &&
+    cachedTokens == null
+  ) {
+    return null;
+  }
+
+  return {
+    promptTokens,
+    completionTokens,
+    reasoningTokens,
+    cachedTokens,
+  };
 }

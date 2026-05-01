@@ -1,4 +1,13 @@
-import { convertInputToMessages } from '../service';
+import type { Response as ServerResponse } from 'express';
+import {
+  buildAggregatedResponse,
+  convertInputToMessages,
+  createAggregatorEventHandlers,
+  createResponseAggregator,
+  createResponseContext,
+  createResponsesEventHandlers,
+} from '../service';
+import { buildResponsesNonStreamingResponse, createResponseTracker } from '../handlers';
 import type { InputItem } from '../types';
 
 describe('convertInputToMessages', () => {
@@ -329,5 +338,119 @@ describe('convertInputToMessages', () => {
       { role: 'assistant', content: [{ type: 'text', text: '2+2 is 4.' }] },
       { role: 'user', content: [{ type: 'text', text: 'And 3+3?' }] },
     ]);
+  });
+});
+
+describe('response builders', () => {
+  it('defaults store to true in tracker-backed responses', () => {
+    const context = createResponseContext({
+      model: 'test-model',
+      input: 'Hello',
+    });
+    const tracker = createResponseTracker();
+
+    const response = buildResponsesNonStreamingResponse(context, tracker);
+
+    expect(response.store).toBe(true);
+  });
+
+  it('reflects store=false in aggregated responses', () => {
+    const context = createResponseContext({
+      model: 'test-model',
+      input: 'Hello',
+      store: false,
+    });
+    const aggregator = createResponseAggregator();
+
+    const response = buildAggregatedResponse(context, aggregator);
+
+    expect(response.store).toBe(false);
+  });
+});
+
+describe('usage accumulation', () => {
+  it('accumulates tracker usage across model-end events and preserves normalized details', () => {
+    const tracker = createResponseTracker();
+    const context = createResponseContext({
+      model: 'test-model',
+      input: 'Hello',
+    });
+    const res = { write: jest.fn() } as unknown as ServerResponse;
+    const { handlers } = createResponsesEventHandlers({
+      res,
+      context,
+      tracker,
+    });
+
+    handlers.on_chat_model_end.handle('on_chat_model_end', {
+      output: {
+        usage_metadata: {
+          input_tokens: 10,
+          output_tokens: 5,
+          input_token_details: { cache_read: 2 },
+          output_token_details: { reasoning: 3 },
+        },
+      },
+    });
+    handlers.on_chat_model_end.handle('on_chat_model_end', {
+      output: {
+        usage_metadata: {
+          input_tokens: 4,
+          output_tokens: 7,
+          input_token_details: { cache_read: 1 },
+          output_token_details: { reasoning: 2 },
+        },
+      },
+    });
+
+    const response = buildResponsesNonStreamingResponse(context, tracker);
+
+    expect(response.usage).toEqual({
+      input_tokens: 14,
+      output_tokens: 12,
+      total_tokens: 26,
+      input_tokens_details: { cached_tokens: 3 },
+      output_tokens_details: { reasoning_tokens: 5 },
+    });
+  });
+
+  it('accumulates aggregator usage across model-end events and preserves normalized details', () => {
+    const aggregator = createResponseAggregator();
+    const handlers = createAggregatorEventHandlers(aggregator);
+    const context = createResponseContext({
+      model: 'test-model',
+      input: 'Hello',
+    });
+
+    handlers.on_chat_model_end.handle('on_chat_model_end', {
+      output: {
+        usage_metadata: {
+          input_tokens: 8,
+          output_tokens: 6,
+          input_token_details: { cache_read: 3 },
+          output_token_details: { reasoning: 1 },
+        },
+      },
+    });
+    handlers.on_chat_model_end.handle('on_chat_model_end', {
+      output: {
+        usage_metadata: {
+          input_tokens: 2,
+          output_tokens: 9,
+          input_token_details: { cache_read: 5 },
+          output_token_details: { reasoning: 4 },
+        },
+      },
+    });
+
+    const response = buildAggregatedResponse(context, aggregator);
+
+    expect(response.usage).toEqual({
+      input_tokens: 10,
+      output_tokens: 15,
+      total_tokens: 25,
+      input_tokens_details: { cached_tokens: 8 },
+      output_tokens_details: { reasoning_tokens: 5 },
+    });
   });
 });

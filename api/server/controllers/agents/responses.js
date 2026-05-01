@@ -28,7 +28,9 @@ const {
   createResponseContext,
   createResponseTracker,
   setupStreamingResponse,
+  emitResponseFailed,
   emitResponseInProgress,
+  emitResponseCompleted,
   convertInputToMessages,
   validateResponseRequest,
   buildAggregatedResponse,
@@ -52,6 +54,44 @@ const {
 const { getModelsConfig } = require('~/server/controllers/ModelController');
 const { logViolation } = require('~/cache');
 const db = require('~/models');
+
+const RESPONSE_SNAPSHOT_METADATA_KEY = 'response_snapshot';
+
+/**
+ * Build the request context used for message persistence.
+ * @param {import('express').Request} req
+ * @returns {{ userId: string | undefined, isTemporary: boolean | undefined, interfaceConfig: unknown }}
+ */
+function createSaveMessageContext(req) {
+  return {
+    userId: req?.user?.id,
+    isTemporary: req?.body?.isTemporary,
+    interfaceConfig: req?.config?.interfaceConfig,
+  };
+}
+
+/**
+ * Return the exact stored response snapshot for an assistant message if present.
+ * @param {{ metadata?: Record<string, unknown> } | null | undefined} message
+ * @returns {import('@librechat/api').Response | null}
+ */
+function getStoredResponseSnapshot(message) {
+  const snapshot = message?.metadata?.[RESPONSE_SNAPSHOT_METADATA_KEY];
+  if (snapshot == null || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    return null;
+  }
+
+  return snapshot;
+}
+
+/**
+ * Store defaults to true per the OpenAI Responses API contract.
+ * @param {import('@librechat/api').ResponseRequest} request
+ * @returns {boolean}
+ */
+function shouldStoreResponse(request) {
+  return request.store !== false;
+}
 
 /**
  * Creates a tool loader function for the agent.
@@ -118,11 +158,10 @@ async function loadPreviousMessages(conversationId, userId) {
       };
 
       // Handle content - could be string or array
-      if (typeof msg.text === 'string') {
-        internalMsg.content = msg.text;
-      } else if (Array.isArray(msg.content)) {
-        // Handle content parts
+      if (Array.isArray(msg.content)) {
         internalMsg.content = msg.content;
+      } else if (typeof msg.text === 'string') {
+        internalMsg.content = msg.text;
       } else if (msg.text) {
         internalMsg.content = String(msg.text);
       }
@@ -144,16 +183,19 @@ async function loadPreviousMessages(conversationId, userId) {
  * @returns {Promise<void>}
  */
 async function saveInputMessages(req, conversationId, inputMessages, agentId) {
+  const saveContext = createSaveMessageContext(req);
+
   for (const msg of inputMessages) {
     if (msg.role === 'user') {
       await db.saveMessage(
-        req,
+        saveContext,
         {
           messageId: msg.messageId || nanoid(),
           conversationId,
           parentMessageId: null,
           isCreatedByUser: true,
           text: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+          ...(Array.isArray(msg.content) ? { content: msg.content } : {}),
           sender: 'User',
           endpoint: EModelEndpoint.agents,
           model: agentId,
@@ -187,8 +229,9 @@ async function saveResponseOutput(req, conversationId, responseId, response, age
   }
 
   // Save the assistant message
+  const saveContext = createSaveMessageContext(req);
   await db.saveMessage(
-    req,
+    saveContext,
     {
       messageId: responseId,
       conversationId,
@@ -200,6 +243,9 @@ async function saveResponseOutput(req, conversationId, responseId, response, age
       model: agentId,
       finish_reason: response.status === 'completed' ? 'stop' : response.status,
       tokenCount: response.usage?.output_tokens,
+      metadata: {
+        [RESPONSE_SNAPSHOT_METADATA_KEY]: response,
+      },
     },
     { context: 'Responses API - save assistant response' },
   );
@@ -232,32 +278,28 @@ async function saveConversation(req, conversationId, agentId, agent) {
 }
 
 /**
- * Convert stored messages to Open Responses output format
- * @param {Array} messages - Stored messages
- * @returns {Array} Output items
+ * Persist the response and its input evidence before returning a stored response.
+ * @param {import('express').Request} req
+ * @param {string} conversationId
+ * @param {Array} inputMessages
+ * @param {string} agentId
+ * @param {object} agent
+ * @param {string} responseId
+ * @param {import('@librechat/api').Response} response
+ * @returns {Promise<void>}
  */
-function convertMessagesToOutputItems(messages) {
-  const output = [];
-
-  for (const msg of messages) {
-    if (!msg.isCreatedByUser) {
-      output.push({
-        type: 'message',
-        id: msg.messageId,
-        role: 'assistant',
-        status: 'completed',
-        content: [
-          {
-            type: 'output_text',
-            text: msg.text || '',
-            annotations: [],
-          },
-        ],
-      });
-    }
-  }
-
-  return output;
+async function persistResponse(
+  req,
+  conversationId,
+  inputMessages,
+  agentId,
+  agent,
+  responseId,
+  response,
+) {
+  await saveConversation(req, conversationId, agentId, agent);
+  await saveInputMessages(req, conversationId, inputMessages, agentId);
+  await saveResponseOutput(req, conversationId, responseId, response, agentId);
 }
 
 /**
@@ -282,6 +324,8 @@ const createResponse = async (req, res) => {
   const agentId = request.model;
   const isStreaming = request.stream === true;
   const summarizationConfig = req.config?.summarization;
+  const userId = req.user?.id ?? 'api-user';
+  const storeResponse = shouldStoreResponse(request);
 
   // Look up the agent
   const agent = await db.getAgent({ id: agentId });
@@ -315,6 +359,7 @@ const createResponse = async (req, res) => {
   });
 
   try {
+    let previousConversationId = null;
     if (request.previous_response_id != null) {
       if (typeof request.previous_response_id !== 'string') {
         return sendResponsesErrorResponse(
@@ -324,12 +369,41 @@ const createResponse = async (req, res) => {
           'invalid_request',
         );
       }
-      if (!(await db.getConvo(req.user?.id, request.previous_response_id))) {
-        return sendResponsesErrorResponse(res, 404, 'Conversation not found', 'not_found');
+      const previousResponseMessage = await db.getMessage({
+        user: req.user?.id,
+        messageId: request.previous_response_id,
+      });
+      if (!previousResponseMessage || previousResponseMessage.isCreatedByUser) {
+        return sendResponsesErrorResponse(
+          res,
+          404,
+          `Previous response not found: ${request.previous_response_id}`,
+          'not_found',
+          'response_not_found',
+        );
       }
+      if (!getStoredResponseSnapshot(previousResponseMessage)) {
+        return sendResponsesErrorResponse(
+          res,
+          409,
+          `Stored response ${request.previous_response_id} does not include an exact persisted snapshot; this legacy record cannot be used as previous_response_id.`,
+          'invalid_state',
+          'response_snapshot_unavailable',
+        );
+      }
+      if (!previousResponseMessage.conversationId) {
+        return sendResponsesErrorResponse(
+          res,
+          409,
+          `Stored response ${request.previous_response_id} is missing conversation linkage.`,
+          'invalid_state',
+          'previous_response_conversation_unavailable',
+        );
+      }
+      previousConversationId = previousResponseMessage.conversationId;
     }
 
-    const conversationId = request.previous_response_id ?? uuidv4();
+    const conversationId = previousConversationId ?? uuidv4();
     const parentMessageId = null;
 
     // Build allowed providers set
@@ -471,9 +545,8 @@ const createResponse = async (req, res) => {
 
     // Load previous messages if previous_response_id is provided
     let previousMessages = [];
-    if (request.previous_response_id) {
-      const userId = req.user?.id ?? 'api-user';
-      previousMessages = await loadPreviousMessages(request.previous_response_id, userId);
+    if (previousConversationId) {
+      previousMessages = await loadPreviousMessages(previousConversationId, userId);
     }
 
     // Convert input to internal messages
@@ -511,8 +584,11 @@ const createResponse = async (req, res) => {
       emitResponseInProgress(handlerConfig);
 
       // Create event handlers
-      const { handlers: responsesHandlers, finalizeStream } =
-        createResponsesEventHandlers(handlerConfig);
+      const {
+        handlers: responsesHandlers,
+        closeOpenStreams,
+        finalizeStream,
+      } = createResponsesEventHandlers(handlerConfig);
 
       // Collect usage for balance tracking
       const collectedUsage = [];
@@ -578,7 +654,6 @@ const createResponse = async (req, res) => {
       };
 
       // Create and run the agent
-      const userId = req.user?.id ?? 'api-user';
       const userMCPAuthMap = mergedMCPAuthMap;
 
       const run = await createRun({
@@ -652,34 +727,44 @@ const createResponse = async (req, res) => {
         logger.error('[Responses API] Error recording usage:', err);
       });
 
-      // Finalize the stream
-      finalizeStream();
-      res.end();
-
-      const duration = Date.now() - requestStartTime;
-      logger.debug(`[Responses API] Request ${responseId} completed in ${duration}ms (streaming)`);
-
-      // Save to database if store: true
-      if (request.store === true) {
+      if (storeResponse) {
+        closeOpenStreams();
+        const finalResponse = buildResponse(context, tracker, 'completed');
         try {
-          // Save conversation
-          await saveConversation(req, conversationId, agentId, agent);
-
-          // Save input messages
-          await saveInputMessages(req, conversationId, inputMessages, agentId);
-
-          // Build response for saving (use tracker with buildResponse for streaming)
-          const finalResponse = buildResponse(context, tracker, 'completed');
-          await saveResponseOutput(req, conversationId, responseId, finalResponse, agentId);
-
+          await persistResponse(
+            req,
+            conversationId,
+            inputMessages,
+            agentId,
+            agent,
+            responseId,
+            finalResponse,
+          );
           logger.debug(
             `[Responses API] Stored response ${responseId} in conversation ${conversationId}`,
           );
         } catch (saveError) {
           logger.error('[Responses API] Error saving response:', saveError);
-          // Don't fail the request if saving fails
+          emitResponseFailed(handlerConfig, {
+            type: 'server_error',
+            message: 'Failed to store response before completion',
+            code: 'response_storage_failed',
+          });
+          writeDone(res);
+          res.end();
+          return;
         }
+
+        emitResponseCompleted(handlerConfig);
+        writeDone(res);
+      } else {
+        finalizeStream();
       }
+
+      res.end();
+
+      const duration = Date.now() - requestStartTime;
+      logger.debug(`[Responses API] Request ${responseId} completed in ${duration}ms (streaming)`);
 
       // Wait for artifact processing after response ends (non-blocking)
       if (artifactPromises.length > 0) {
@@ -744,7 +829,6 @@ const createResponse = async (req, res) => {
           : {}),
       };
 
-      const userId = req.user?.id ?? 'api-user';
       const userMCPAuthMap = mergedMCPAuthMap;
 
       const run = await createRun({
@@ -827,20 +911,29 @@ const createResponse = async (req, res) => {
 
       const response = buildAggregatedResponse(context, aggregator);
 
-      if (request.store === true) {
+      if (storeResponse) {
         try {
-          await saveConversation(req, conversationId, agentId, agent);
-
-          await saveInputMessages(req, conversationId, inputMessages, agentId);
-
-          await saveResponseOutput(req, conversationId, responseId, response, agentId);
-
+          await persistResponse(
+            req,
+            conversationId,
+            inputMessages,
+            agentId,
+            agent,
+            responseId,
+            response,
+          );
           logger.debug(
             `[Responses API] Stored response ${responseId} in conversation ${conversationId}`,
           );
         } catch (saveError) {
           logger.error('[Responses API] Error saving response:', saveError);
-          // Don't fail the request if saving fails
+          return sendResponsesErrorResponse(
+            res,
+            500,
+            'Failed to store response before completion',
+            'server_error',
+            'response_storage_failed',
+          );
         }
       }
 
@@ -934,7 +1027,6 @@ const listModels = async (req, res) => {
  * Get Response - GET /v1/responses/:id
  *
  * Retrieves a stored response by its ID.
- * The response ID maps to a conversationId in LibreChat's storage.
  *
  * @param {import('express').Request} req
  * @param {import('express').Response} res
@@ -948,11 +1040,8 @@ const getResponse = async (req, res) => {
       return sendResponsesErrorResponse(res, 400, 'Response ID is required');
     }
 
-    // The responseId could be either the response ID or the conversation ID
-    // Try to find a conversation with this ID
-    const conversation = await db.getConvo(userId, responseId);
-
-    if (!conversation) {
+    const responseMessage = await db.getMessage({ user: userId, messageId: responseId });
+    if (!responseMessage) {
       return sendResponsesErrorResponse(
         res,
         404,
@@ -962,68 +1051,18 @@ const getResponse = async (req, res) => {
       );
     }
 
-    // Load messages for this conversation
-    const messages = await db.getMessages({ conversationId: responseId, user: userId });
-
-    if (!messages || messages.length === 0) {
+    const storedSnapshot = getStoredResponseSnapshot(responseMessage);
+    if (!storedSnapshot) {
       return sendResponsesErrorResponse(
         res,
-        404,
-        `No messages found for response: ${responseId}`,
-        'not_found',
-        'response_not_found',
+        409,
+        `Stored response ${responseId} does not include an exact persisted snapshot; this legacy record cannot be returned truthfully.`,
+        'invalid_state',
+        'response_snapshot_unavailable',
       );
     }
 
-    // Convert messages to Open Responses output format
-    const output = convertMessagesToOutputItems(messages);
-
-    // Find the last assistant message for usage info
-    const lastAssistantMessage = messages.filter((m) => !m.isCreatedByUser).pop();
-
-    // Build the response object
-    const response = {
-      id: responseId,
-      object: 'response',
-      created_at: Math.floor(new Date(conversation.createdAt || Date.now()).getTime() / 1000),
-      completed_at: Math.floor(new Date(conversation.updatedAt || Date.now()).getTime() / 1000),
-      status: 'completed',
-      incomplete_details: null,
-      model: conversation.agentId || conversation.model || 'unknown',
-      previous_response_id: null,
-      instructions: null,
-      output,
-      error: null,
-      tools: [],
-      tool_choice: 'auto',
-      truncation: 'disabled',
-      parallel_tool_calls: true,
-      text: { format: { type: 'text' } },
-      temperature: 1,
-      top_p: 1,
-      presence_penalty: 0,
-      frequency_penalty: 0,
-      top_logprobs: null,
-      reasoning: null,
-      user: userId,
-      usage: lastAssistantMessage?.tokenCount
-        ? {
-            input_tokens: 0,
-            output_tokens: lastAssistantMessage.tokenCount,
-            total_tokens: lastAssistantMessage.tokenCount,
-          }
-        : null,
-      max_output_tokens: null,
-      max_tool_calls: null,
-      store: true,
-      background: false,
-      service_tier: 'default',
-      metadata: {},
-      safety_identifier: null,
-      prompt_cache_key: null,
-    };
-
-    res.json(response);
+    res.json(storedSnapshot);
   } catch (error) {
     logger.error('[Responses API] Error getting response:', error);
     sendResponsesErrorResponse(
