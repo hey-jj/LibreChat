@@ -500,7 +500,7 @@ export type TRefreshTokenResponse = {
 };
 
 export type TCheckUserKeyResponse = {
-  expiresAt: string;
+  expiresAt: string | null;
 };
 
 export type TRequestPasswordResetResponse = {

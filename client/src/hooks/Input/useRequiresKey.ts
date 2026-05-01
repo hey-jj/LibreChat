@@ -12,8 +12,8 @@ export default function useRequiresKey() {
     endpoint,
     'userProvide',
   );
-  const { getExpiry } = useUserKey(endpoint ?? '');
-  const expiryTime = getExpiry();
-  const requiresKey = !expiryTime && userProvidesKey;
-  return { requiresKey };
+  const { hasKey, isKeyValid, keyStatus } = useUserKey(endpoint ?? '');
+  const isEndpointConfigPending = Boolean(endpoint) && endpointsConfig == null;
+  const requiresKey = !isKeyValid && (isEndpointConfigPending || Boolean(userProvidesKey));
+  return { requiresKey, userProvidesKey: Boolean(userProvidesKey), hasKey, keyStatus };
 }

@@ -71,7 +71,7 @@ export default function useChatFunctions({
   const setFilesToDelete = useSetFilesToDelete();
   const getEphemeralAgent = useGetEphemeralAgent();
   const isTemporary = useRecoilValue(store.isTemporary);
-  const { getExpiry } = useUserKey(immutableConversation?.endpoint ?? '');
+  const { getExpiry, isKeyValid } = useUserKey(immutableConversation?.endpoint ?? '');
   const setIsSubmitting = useSetRecoilState(store.isSubmittingFamily(index));
   const setShowStopButton = useSetRecoilState(store.showStopButtonByIndex(index));
   const resetLatestMultiMessage = useResetRecoilState(store.latestMessageFamily(index + 1));
@@ -120,6 +120,13 @@ export default function useChatFunctions({
 
     if (isContinued && !latestMessage) {
       console.error('cannot continue AI message without latestMessage!');
+      return;
+    }
+
+    const endpointsConfig = queryClient.getQueryData<TEndpointsConfig>([QueryKeys.endpoints]);
+    const requiresUserKey = Boolean(getEndpointField(endpointsConfig, endpoint, 'userProvide'));
+    if (endpoint !== EModelEndpoint.agents && requiresUserKey && !isKeyValid) {
+      console.error(`cannot send message without a valid user key for ${endpoint}`);
       return;
     }
 
@@ -172,7 +179,6 @@ export default function useChatFunctions({
       thread_id = currentMessages.find((message) => message.thread_id)?.thread_id;
     }
 
-    const endpointsConfig = queryClient.getQueryData<TEndpointsConfig>([QueryKeys.endpoints]);
     const startupConfig = queryClient.getQueryData<TStartupConfig>(startupConfigKey(true));
     const endpointType = getEndpointField(endpointsConfig, endpoint, 'type');
     const iconURL = conversation?.iconURL;
@@ -197,7 +203,7 @@ export default function useChatFunctions({
       convo,
     ) as TEndpointOption;
     if (endpoint !== EModelEndpoint.agents) {
-      endpointOption.key = getExpiry();
+      endpointOption.key = isKeyValid ? getExpiry() : undefined;
       endpointOption.thread_id = thread_id;
       endpointOption.modelDisplayLabel = modelDisplayLabel;
     } else {

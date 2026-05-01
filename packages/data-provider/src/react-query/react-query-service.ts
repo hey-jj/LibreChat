@@ -264,7 +264,7 @@ export const useUserKeyQuery = (
     [QueryKeys.name, name],
     () => {
       if (!name) {
-        return Promise.resolve({ expiresAt: '' });
+        return Promise.resolve({ expiresAt: null });
       }
       return dataService.userKeyQuery(name);
     },

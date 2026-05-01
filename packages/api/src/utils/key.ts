@@ -128,7 +128,19 @@ export async function loadServiceKey(keyPath: string): Promise<GoogleServiceKey 
  */
 export function checkUserKeyExpiry(expiresAt: string, endpoint: string): void {
   const expiresAtDate = new Date(expiresAt);
-  if (expiresAtDate < new Date()) {
+  const expiryTime = expiresAtDate.getTime();
+
+  if (Number.isNaN(expiryTime)) {
+    const errorMessage = JSON.stringify({
+      type: ErrorTypes.INVALID_USER_KEY,
+      reason: 'invalid_expiry',
+      expiresAt,
+      endpoint,
+    });
+    throw new Error(errorMessage);
+  }
+
+  if (expiryTime < Date.now()) {
     const errorMessage = JSON.stringify({
       type: ErrorTypes.EXPIRED_USER_KEY,
       expiredAt: expiresAtDate.toLocaleString(),

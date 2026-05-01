@@ -172,9 +172,10 @@ const SetKeyDialog = ({
 
   const [userKey, setUserKey] = useState('');
   const [expiresAtLabel, setExpiresAtLabel] = useState(EXPIRY.TWELVE_HOURS.label);
-  const { getExpiry, saveUserKey } = useUserKey(endpoint);
+  const { getExpiry, saveUserKey, hasKey, keyStatus } = useUserKey(endpoint);
   const { showToast } = useToastContext();
   const localize = useLocalize();
+  const endpointLabel = alternateName[endpoint] ?? endpoint;
 
   const expirationOptions = Object.values(EXPIRY);
 
@@ -193,20 +194,24 @@ const SetKeyDialog = ({
     }
 
     const saveKey = (key: string) => {
-      try {
-        saveUserKey(key, expiresAt);
-        showToast({
-          message: localize('com_ui_save_key_success'),
-          status: NotificationSeverity.SUCCESS,
-        });
-        onOpenChange(false);
-      } catch (error) {
-        logger.error('Error saving user key:', error);
-        showToast({
-          message: localize('com_ui_save_key_error'),
-          status: NotificationSeverity.ERROR,
-        });
-      }
+      saveUserKey(key, expiresAt, {
+        onSuccess: () => {
+          showToast({
+            message: localize('com_ui_save_key_success'),
+            status: NotificationSeverity.SUCCESS,
+          });
+          setUserKey('');
+          methods.reset();
+          onOpenChange(false);
+        },
+        onError: (error) => {
+          logger.error('Error saving user key:', error);
+          showToast({
+            message: localize('com_ui_save_key_error'),
+            status: NotificationSeverity.ERROR,
+          });
+        },
+      });
     };
 
     if (formSet.has(endpoint) || formSet.has(endpointType ?? '')) {
@@ -253,7 +258,6 @@ const SetKeyDialog = ({
         }
 
         saveKey(JSON.stringify(userProvidedData));
-        methods.reset();
       })();
       return;
     }
@@ -267,29 +271,37 @@ const SetKeyDialog = ({
     }
 
     saveKey(userKey);
-    setUserKey('');
   };
 
   const EndpointComponent =
     endpointComponents[endpointType ?? endpoint] ?? endpointComponents['default'];
   const expiryTime = getExpiry();
+  const expiryMessage =
+    keyStatus === 'expired' && expiryTime
+      ? localize('com_error_expired_user_key', {
+          0: endpointLabel,
+          1: new Date(expiryTime).toLocaleString(),
+        })
+      : keyStatus === 'invalid'
+        ? localize('com_error_invalid_user_key')
+        : expiryTime === 'never'
+          ? localize('com_endpoint_config_key_never_expires')
+          : expiryTime
+            ? `${localize('com_endpoint_config_key_encryption')} ${new Date(
+                expiryTime,
+              ).toLocaleString()}`
+            : null;
 
   return (
     <OGDialog open={open} onOpenChange={onOpenChange}>
       <OGDialogContent className="w-11/12 max-w-2xl">
         <OGDialogHeader>
           <OGDialogTitle>
-            {`${localize('com_endpoint_config_key_for')} ${alternateName[endpoint] ?? endpoint}`}
+            {`${localize('com_endpoint_config_key_for')} ${endpointLabel}`}
           </OGDialogTitle>
         </OGDialogHeader>
         <div className="grid w-full items-center gap-2 py-4">
-          <small className="text-red-600">
-            {expiryTime === 'never'
-              ? localize('com_endpoint_config_key_never_expires')
-              : `${localize('com_endpoint_config_key_encryption')} ${new Date(
-                  expiryTime ?? 0,
-                ).toLocaleString()}`}
-          </small>
+          {expiryMessage != null && <small className="text-red-600">{expiryMessage}</small>}
           <Dropdown
             label="Expires "
             value={expiresAtLabel}
@@ -310,11 +322,7 @@ const SetKeyDialog = ({
           <HelpText endpoint={endpoint} />
         </div>
         <OGDialogFooter>
-          <RevokeKeysButton
-            endpoint={endpoint}
-            disabled={!(expiryTime ?? '')}
-            setDialogOpen={onOpenChange}
-          />
+          <RevokeKeysButton endpoint={endpoint} disabled={!hasKey} setDialogOpen={onOpenChange} />
           <Button variant="submit" onClick={submit}>
             {localize('com_ui_submit')}
           </Button>
