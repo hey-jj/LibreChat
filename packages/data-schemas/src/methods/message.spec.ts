@@ -268,6 +268,7 @@ describe('Message Operations', () => {
   describe('deleteMessagesSince', () => {
     it('should delete messages only for the authenticated user', async () => {
       const conversationId = uuidv4();
+      const createdAt = new Date('2026-05-13T12:00:00.000Z');
 
       // Create multiple messages in the same conversation
       await saveMessage(mockCtx, {
@@ -275,6 +276,7 @@ describe('Message Operations', () => {
         conversationId,
         text: 'First message',
         user: 'user123',
+        createdAt,
       });
 
       await saveMessage(mockCtx, {
@@ -282,6 +284,7 @@ describe('Message Operations', () => {
         conversationId,
         text: 'Second message',
         user: 'user123',
+        createdAt: new Date(createdAt.getTime() + 1000),
       });
 
       await saveMessage(mockCtx, {
@@ -289,6 +292,7 @@ describe('Message Operations', () => {
         conversationId,
         text: 'Third message',
         user: 'user123',
+        createdAt: new Date(createdAt.getTime() + 2000),
       });
 
       // Delete messages since message2 (this should only delete messages created AFTER msg2)
