@@ -17,6 +17,7 @@ jest.mock('recoil', () => ({
   useSetRecoilState: jest.fn(),
   useResetRecoilState: jest.fn(),
   useRecoilValue: jest.fn(),
+  useRecoilCallback: jest.fn(() => jest.fn(() => [])),
 }));
 
 jest.mock('~/hooks/Files/useSetFilesToDelete', () => ({
