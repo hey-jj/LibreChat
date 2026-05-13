@@ -1,13 +1,5 @@
 const express = require('express');
-const {
-  isEnabled,
-  sendEvent,
-  isCanonicalResumeState,
-  isReplayEvent,
-  createSyncEvent,
-  createFinalErrorEvent,
-  GenerationJobManager,
-} = require('@librechat/api');
+const { isEnabled, GenerationJobManager } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const {
   uaParser,
@@ -24,9 +16,6 @@ const { v1 } = require('./v1');
 const chat = require('./chat');
 
 const { LIMIT_MESSAGE_IP, LIMIT_MESSAGE_USER } = process.env ?? {};
-const RESUME_SYNC_UNAVAILABLE_MESSAGE =
-  'Unable to resume stream: canonical sync state unavailable.';
-const RESUME_SYNC_UNAVAILABLE_CODE = 'canonical_resume_state_unavailable';
 
 /** Untenanted jobs (pre-multi-tenancy) remain accessible if the userId check passes. */
 function hasTenantMismatch(job, user) {
@@ -51,6 +40,9 @@ router.use('/v1', openai);
 
 router.use(requireJwtAuth);
 router.use(checkBan);
+router.use(uaParser);
+
+router.use('/', v1);
 
 /**
  * Stream endpoints - mounted before chatRouter to bypass rate limiters
@@ -61,8 +53,8 @@ router.use(checkBan);
  * @route GET /chat/stream/:streamId
  * @desc Subscribe to an ongoing generation job's SSE stream with replay support
  * @access Private
- * @description Sends one canonical sync payload on reconnect or fails in-band on the message channel
- * @query resume=true - Indicates this is a reconnection (sends a sync event when canonical state exists)
+ * @description Sends sync event with resume state, replays missed chunks, then streams live
+ * @query resume=true - Indicates this is a reconnection (sends sync event)
  */
 router.get('/chat/stream/:streamId', async (req, res) => {
   const { streamId } = req.params;
@@ -95,7 +87,7 @@ router.get('/chat/stream/:streamId', async (req, res) => {
 
   const writeEvent = (event) => {
     if (!res.writableEnded) {
-      sendEvent(res, event);
+      res.write(`event: message\ndata: ${JSON.stringify(event)}\n\n`);
       if (typeof res.flush === 'function') {
         res.flush();
       }
@@ -107,86 +99,41 @@ router.get('/chat/stream/:streamId', async (req, res) => {
     res.end();
   };
 
-  const onError = (message, code) => {
-    if (res.writableEnded) {
-      return;
+  const onError = (error) => {
+    if (!res.writableEnded) {
+      res.write(`event: error\ndata: ${JSON.stringify({ error })}\n\n`);
+      if (typeof res.flush === 'function') {
+        res.flush();
+      }
+      res.end();
     }
-
-    const errorEvent =
-      code != null ? createFinalErrorEvent(message, code) : createFinalErrorEvent(message);
-    writeEvent(errorEvent);
-    res.end();
   };
 
   let result;
 
   if (isResume) {
-    const bufferedEvents = [];
-    let bufferedTerminal = null;
-    const gatedWriteEvent = (event) => {
-      bufferedEvents.push(event);
-    };
-    const gatedOnDone = (event) => {
-      bufferedTerminal = { type: 'done', event };
-    };
-    const gatedOnError = (message) => {
-      bufferedTerminal = { type: 'error', message };
-    };
-    const {
-      subscription,
-      resumeState: rawResumeState,
-      pendingEvents,
-    } = await GenerationJobManager.subscribeWithResume(
-      streamId,
-      gatedWriteEvent,
-      gatedOnDone,
-      gatedOnError,
-    );
-    const resumeState = isCanonicalResumeState(rawResumeState) ? rawResumeState : null;
-    const replayEvents =
-      Array.isArray(pendingEvents) && pendingEvents.every(isReplayEvent) ? pendingEvents : null;
-
-    if (rawResumeState != null && !resumeState) {
-      logger.warn(`[AgentStream] Resume state missing canonical IDs for ${streamId}`);
-    }
-    if (Array.isArray(pendingEvents) && replayEvents == null) {
-      logger.warn(
-        `[AgentStream] Pending replay events fell outside the canonical contract for ${streamId}`,
-      );
-    }
+    const { subscription, resumeState, pendingEvents } =
+      await GenerationJobManager.subscribeWithResume(streamId, writeEvent, onDone, onError);
 
     if (!res.writableEnded) {
-      if (resumeState && replayEvents) {
-        const syncEvent = createSyncEvent({
-          resumeState,
-          pendingEvents: replayEvents,
-        });
-        writeEvent(syncEvent);
+      if (resumeState) {
+        res.write(
+          `event: message\ndata: ${JSON.stringify({ sync: true, resumeState, pendingEvents })}\n\n`,
+        );
+        if (typeof res.flush === 'function') {
+          res.flush();
+        }
         GenerationJobManager.markSyncSent(streamId);
         logger.debug(
-          `[AgentStream] Sent sync event for ${streamId} with ${resumeState.runSteps.length} run steps, ${replayEvents.length} pending events`,
+          `[AgentStream] Sent sync event for ${streamId} with ${resumeState.runSteps.length} run steps, ${pendingEvents.length} pending events`,
         );
-        for (const event of bufferedEvents) {
+      } else if (pendingEvents.length > 0) {
+        for (const event of pendingEvents) {
           writeEvent(event);
         }
-        if (bufferedTerminal?.type === 'done') {
-          onDone(bufferedTerminal.event);
-        } else if (bufferedTerminal?.type === 'error') {
-          onError(bufferedTerminal.message);
-        }
-      } else {
-        const isCanonicalResumeFailure = bufferedTerminal?.type !== 'error';
-        const resumeFailureMessage = !isCanonicalResumeFailure
-          ? bufferedTerminal.message
-          : RESUME_SYNC_UNAVAILABLE_MESSAGE;
         logger.warn(
-          `[AgentStream] Missing canonical resume state for ${streamId}; sent in-band final error instead of replay fallback`,
+          `[AgentStream] Resume state null for ${streamId}, replayed ${pendingEvents.length} gap events directly`,
         );
-        if (isCanonicalResumeFailure) {
-          onError(resumeFailureMessage, RESUME_SYNC_UNAVAILABLE_CODE);
-        } else {
-          onError(resumeFailureMessage);
-        }
       }
     }
 
@@ -196,15 +143,7 @@ router.get('/chat/stream/:streamId', async (req, res) => {
   }
 
   if (!result) {
-    if (res.writableEnded) {
-      return;
-    }
     return res.status(404).json({ error: 'Failed to subscribe to stream' });
-  }
-
-  if (res.writableEnded) {
-    result.unsubscribe();
-    return;
   }
 
   req.on('close', () => {
@@ -253,18 +192,7 @@ router.get('/chat/status/:conversationId', async (req, res) => {
 
   // Get resume state which contains aggregatedContent
   // Avoid calling both getStreamInfo and getResumeState (both fetch content)
-  const rawResumeState = await GenerationJobManager.getResumeState(conversationId);
-  const resumeState = isCanonicalResumeState(rawResumeState) ? rawResumeState : null;
-  if (rawResumeState != null && !resumeState) {
-    logger.warn(`[AgentStream] Resume state missing canonical IDs for ${conversationId}`);
-  }
-  const resumeError =
-    resumeState == null
-      ? {
-          code: RESUME_SYNC_UNAVAILABLE_CODE,
-          message: RESUME_SYNC_UNAVAILABLE_MESSAGE,
-        }
-      : null;
+  const resumeState = await GenerationJobManager.getResumeState(conversationId);
   const isActive = job.status === 'running';
 
   res.json({
@@ -274,8 +202,6 @@ router.get('/chat/status/:conversationId', async (req, res) => {
     aggregatedContent: resumeState?.aggregatedContent ?? [],
     createdAt: job.createdAt,
     resumeState,
-    resumeStateStatus: resumeState == null ? 'unavailable' : 'available',
-    resumeError,
   });
 });
 
@@ -381,9 +307,6 @@ router.post('/chat/abort', async (req, res) => {
   logger.warn(`[AgentStream] Job not found for streamId: ${jobStreamId}`);
   return res.status(404).json({ error: 'Job not found', streamId: jobStreamId });
 });
-
-router.use(uaParser);
-router.use('/', v1);
 
 const chatRouter = express.Router();
 chatRouter.use(configMiddleware);

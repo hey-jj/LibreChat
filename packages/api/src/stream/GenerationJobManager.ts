@@ -1000,8 +1000,8 @@ class GenerationJobManagerClass {
     const updates: Partial<SerializableJobData> = {
       userMessage: {
         messageId: message.messageId,
-        parentMessageId: message.parentMessageId ?? undefined,
-        conversationId: message.conversationId ?? undefined,
+        parentMessageId: message.parentMessageId,
+        conversationId: message.conversationId,
         text: message.text,
       },
     };

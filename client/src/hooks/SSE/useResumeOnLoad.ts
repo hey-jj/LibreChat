@@ -5,26 +5,6 @@ import type { TMessage, TConversation, TSubmission, Agents } from 'librechat-dat
 import { useStreamStatus } from '~/data-provider';
 import store from '~/store';
 
-type ResumeStateWithExactIds = Agents.ResumeState & {
-  userMessage: NonNullable<Agents.ResumeState['userMessage']> & {
-    messageId: string;
-  };
-  responseMessageId: string;
-};
-
-function hasExactResumeStateIds(
-  resumeState: Agents.ResumeState,
-): resumeState is ResumeStateWithExactIds {
-  return (
-    Array.isArray(resumeState.runSteps) &&
-    (resumeState.aggregatedContent == null || Array.isArray(resumeState.aggregatedContent)) &&
-    typeof resumeState.responseMessageId === 'string' &&
-    resumeState.responseMessageId.length > 0 &&
-    typeof resumeState.userMessage?.messageId === 'string' &&
-    resumeState.userMessage.messageId.length > 0
-  );
-}
-
 /**
  * Build a submission object from resume state for reconnected streams.
  * This provides the minimum data needed for useResumableSSE to subscribe.
@@ -34,13 +14,10 @@ function buildSubmissionFromResumeState(
   streamId: string,
   messages: TMessage[],
   conversationId: string,
-): TSubmission | null {
-  if (!hasExactResumeStateIds(resumeState)) {
-    return null;
-  }
-
+): TSubmission {
   const userMessageData = resumeState.userMessage;
-  const { responseMessageId } = resumeState;
+  const responseMessageId =
+    resumeState.responseMessageId ?? `${userMessageData?.messageId ?? 'resume'}_`;
 
   // Try to find existing user message in the messages array (from database)
   const existingUserMessage = messages.find(
@@ -49,20 +26,30 @@ function buildSubmissionFromResumeState(
 
   // Try to find existing response message in the messages array (from database)
   const existingResponseMessage = messages.find(
-    (m) => !m.isCreatedByUser && m.messageId === responseMessageId,
+    (m) =>
+      !m.isCreatedByUser &&
+      (m.messageId === responseMessageId || m.parentMessageId === userMessageData?.messageId),
   );
 
   // Create or use existing user message
   const userMessage: TMessage =
     existingUserMessage ??
-    (tMessageSchema.parse({
-      messageId: userMessageData.messageId,
-      parentMessageId: userMessageData.parentMessageId ?? Constants.NO_PARENT,
-      conversationId: userMessageData.conversationId ?? conversationId,
-      text: userMessageData.text ?? '',
-      isCreatedByUser: true,
-      role: 'user',
-    }) as TMessage);
+    (userMessageData
+      ? (tMessageSchema.parse({
+          messageId: userMessageData.messageId,
+          parentMessageId: userMessageData.parentMessageId ?? Constants.NO_PARENT,
+          conversationId: userMessageData.conversationId ?? conversationId,
+          text: userMessageData.text ?? '',
+          isCreatedByUser: true,
+          role: 'user',
+        }) as TMessage)
+      : (messages[messages.length - 2] ??
+        ({
+          messageId: 'resume_user_msg',
+          conversationId,
+          text: '',
+          isCreatedByUser: true,
+        } as TMessage)));
 
   // ALWAYS use aggregatedContent from resumeState - it has the latest content from the running job.
   // DB content may be stale (saved at disconnect, but generation continued).
@@ -208,6 +195,8 @@ export default function useResumeOnLoad(
       return;
     }
 
+    processedConvoRef.current = conversationId;
+
     console.log('[ResumeOnLoad] Found active job, creating submission...', {
       streamId: streamStatus.streamId,
       status: streamStatus.status,
@@ -224,25 +213,29 @@ export default function useResumeOnLoad(
         messages,
         conversationId,
       );
-      if (submission) {
-        processedConvoRef.current = conversationId;
-        setSubmission(submission);
-        return;
-      }
-
-      console.warn('[ResumeOnLoad] Resume state missing canonical message identifiers', {
-        conversationId,
-        streamId: streamStatus.streamId,
-        resumeError: streamStatus.resumeError ?? null,
-      });
-      return;
+      setSubmission(submission);
+    } else {
+      // Minimal submission without resume state
+      const lastUserMessage = [...messages].reverse().find((m) => m.isCreatedByUser);
+      const submission = {
+        messages,
+        userMessage:
+          lastUserMessage ?? ({ messageId: 'resume', conversationId, text: '' } as TMessage),
+        initialResponse: {
+          messageId: 'resume_',
+          conversationId,
+          text: '',
+          content: streamStatus.aggregatedContent ?? [{ type: 'text', text: '' }],
+        } as TMessage,
+        conversation: { conversationId, title: 'Resumed Chat' } as TConversation,
+        isRegenerate: false,
+        isTemporary: false,
+        endpointOption: {},
+        // Signal to useResumableSSE to subscribe to existing stream instead of starting new
+        resumeStreamId: streamStatus.streamId,
+      } as TSubmission & { resumeStreamId: string };
+      setSubmission(submission);
     }
-
-    console.warn('[ResumeOnLoad] Active stream missing canonical resume state', {
-      conversationId,
-      streamId: streamStatus.streamId,
-      resumeError: streamStatus.resumeError ?? null,
-    });
   }, [
     conversationId,
     resumableEnabled,

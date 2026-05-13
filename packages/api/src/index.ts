@@ -53,14 +53,6 @@ export * from './cache';
 export * from './stream';
 /* Diagnostics */
 export { memoryDiagnostics } from './utils/memory';
-/* SSE contract helpers */
-export {
-  isCanonicalResumeState,
-  isReplayEvent,
-  isSyncEvent,
-  createSyncEvent,
-  createFinalErrorEvent,
-} from './types/events';
 /* types */
 export type * from './mcp/types';
 export type * from './flow/types';
