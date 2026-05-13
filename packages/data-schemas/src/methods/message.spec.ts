@@ -744,7 +744,7 @@ describe('Message Operations', () => {
         createdAt,
         updatedAt: createdAt,
       });
-      return Message.findOne({ messageId }).lean();
+      return Message.findOne({ messageId }).lean<IMessage>();
     };
 
     /**
